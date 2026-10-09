@@ -1,10 +1,14 @@
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::time::{Duration, Instant};
 
 const TICK_RATE: Duration = Duration::from_millis(500);
+const MUTED: Color = Color::DarkGray;
+const ACCENT: Color = Color::Cyan;
 
 struct App {
     running: bool,
@@ -47,8 +51,9 @@ impl App {
             return;
         }
 
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.running = false,
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.running = false,
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.running = false,
             _ => {}
         }
     }
@@ -68,11 +73,44 @@ impl App {
         let [cpu, memory] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top);
 
-        frame.render_widget(Block::bordered().title("Fastop"), header);
-        frame.render_widget(Block::bordered().title("CPU"), cpu);
-        frame.render_widget(Block::bordered().title("Memory"), memory);
-        frame.render_widget(Block::bordered().title("History"), history);
-        frame.render_widget(Block::bordered().title("Processes"), processes);
-        frame.render_widget(Paragraph::new("q quit"), footer);
+        self.render_header(frame, header);
+        frame.render_widget(panel("CPU"), cpu);
+        frame.render_widget(panel("Memory"), memory);
+        frame.render_widget(panel("History"), history);
+        frame.render_widget(panel("Processes"), processes);
+        self.render_footer(frame, footer)
     }
+
+    fn render_header(&mut self, frame: &mut Frame, area: Rect) {
+        let sep = Span::styled(" | ", MUTED);
+        let line = Line::from(vec![
+            " Fastop".bold().fg(ACCENT),
+            sep,
+            Span::raw("Live System Monitor"),
+        ]);
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(MUTED);
+
+        frame.render_widget(Paragraph::new(line).block(block), area);
+    }
+    fn render_footer(&mut self, frame: &mut Frame, area: Rect) {
+        let key = |k: &'static str, desc: &'static str| {
+            [
+                Span::styled(format!(" {k} "), Style::default().fg(ACCENT).bold()),
+                Span::styled(format!("{desc}\t"), Style::default().fg(MUTED)),
+            ]
+        };
+
+        let spans: Vec<Span> = [key("q", "quit")].into_iter().flatten().collect();
+
+        frame.render_widget(Line::from(spans), area);
+    }
+}
+
+fn panel(title: &str) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(MUTED)
+        .title(Line::from(format!(" {title} ")).fg(ACCENT).bold())
 }
