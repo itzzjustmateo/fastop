@@ -7,7 +7,9 @@ use ratatui::{DefaultTerminal, Frame};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use sysinfo::{Components, Disk, Disks, MINIMUM_CPU_UPDATE_INTERVAL, ProcessesToUpdate, System};
+use sysinfo::{
+    Components, Disk, Disks, MINIMUM_CPU_UPDATE_INTERVAL, ProcessesToUpdate, System, Users,
+};
 
 const TICK_RATE: Duration = Duration::from_millis(500);
 const MUTED: Color = Color::DarkGray;
@@ -17,6 +19,8 @@ const ACCENT: Color = Color::Cyan;
 enum SortBy {
     Cpu,
     Memory,
+    Pid,
+    Name,
 }
 
 impl SortBy {
@@ -24,12 +28,28 @@ impl SortBy {
         match self {
             SortBy::Cpu => "CPU",
             SortBy::Memory => "MEM",
+            SortBy::Pid => "PID",
+            SortBy::Name => "NAME",
+        }
+    }
+
+    fn descending(self) -> bool {
+        matches!(self, SortBy::Cpu | SortBy::Memory)
+    }
+
+    fn next(self) -> Self {
+        match self {
+            SortBy::Cpu => SortBy::Memory,
+            SortBy::Memory => SortBy::Pid,
+            SortBy::Pid => SortBy::Name,
+            SortBy::Name => SortBy::Cpu,
         }
     }
 }
 
 struct ProcessRow {
     pid: u32,
+    user: String,
     name: String,
     cpu: f32,
     memory: u64,
@@ -40,6 +60,23 @@ struct DiskRow {
     label: String,
     used: u64,
     total: u64,
+}
+
+#[derive(Clone, Copy)]
+enum PanelKind {
+    Cpu,
+    Memory,
+    Gpu,
+    Disks,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProcessColumn {
+    Pid,
+    User,
+    Name,
+    Cpu,
+    Memory,
 }
 
 struct Gpu {
@@ -71,6 +108,7 @@ struct App {
     system: System,
     components: Components,
     disks: Disks,
+    users: Users,
     host_name: String,
     os_name: String,
     cpu_name: String,
@@ -101,6 +139,7 @@ impl App {
             system,
             components: Components::new_with_refreshed_list(),
             disks: Disks::new_with_refreshed_list(),
+            users: Users::new_with_refreshed_list(),
             host_name: System::host_name().unwrap_or_else(|| "unknown".into()),
             os_name: System::long_os_version().unwrap_or_else(|| "unknown OS".into()),
             cpu_name,
@@ -150,10 +189,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
             KeyCode::Char('s') => {
-                self.sort = match self.sort {
-                    SortBy::Cpu => SortBy::Memory,
-                    SortBy::Memory => SortBy::Cpu,
-                };
+                self.sort = self.sort.next();
                 self.update_process_list();
             }
             _ => {}
@@ -188,6 +224,7 @@ impl App {
         self.system.refresh_processes(ProcessesToUpdate::All, true);
         self.components.refresh(false);
         self.disks.refresh(true);
+        self.users.refresh();
 
         if let Some(gpu) = &mut self.gpu {
             gpu.refresh();
@@ -197,28 +234,29 @@ impl App {
     }
 
     fn update_process_list(&mut self) {
+        let users = &self.users;
+
         let mut processes: Vec<ProcessRow> = self
             .system
             .processes()
             .iter()
-            .map(|(pid, process)| ProcessRow {
-                pid: pid.as_u32(),
-                name: process.name().to_string_lossy().into_owned(),
-                cpu: process.cpu_usage(),
-                memory: process.memory(),
+            .map(|(pid, process)| {
+                let user = process
+                    .user_id()
+                    .and_then(|uid| users.get_user_by_id(uid))
+                    .map_or_else(|| "?".to_string(), |user| user.name().to_string());
+
+                ProcessRow {
+                    pid: pid.as_u32(),
+                    user,
+                    name: process.name().to_string_lossy().into_owned(),
+                    cpu: process.cpu_usage(),
+                    memory: process.memory(),
+                }
             })
             .collect();
 
-        processes.sort_by(|a, b| match self.sort {
-            SortBy::Cpu => b
-                .cpu
-                .total_cmp(&a.cpu)
-                .then_with(|| b.memory.cmp(&a.memory)),
-            SortBy::Memory => b
-                .memory
-                .cmp(&a.memory)
-                .then_with(|| b.cpu.total_cmp(&a.cpu)),
-        });
+        processes.sort_by(|a, b| compare_processes(self.sort, a, b));
 
         self.processes = processes;
 
@@ -233,43 +271,75 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+
+        let header_height = header_height(area);
+        let footer_height = u16::from(area.height >= 4);
+        let (grid, panels_height) = panels_layout(area);
+
         let [header, panels, processes, footer] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(18),
+            Constraint::Length(header_height),
+            Constraint::Length(panels_height),
             Constraint::Fill(1),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
-        .areas(frame.area());
+        .areas(area);
 
-        let [cpu_row, device_row] =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(panels);
+        if panels_height > 0 {
+            if grid {
+                let [cpu_row, device_row] =
+                    Layout::vertical([Constraint::Ratio(1, 2); 2]).areas(panels);
 
-        let [cpu, memory] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(cpu_row);
-        let [gpu, ssd] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(device_row);
+                let [cpu, memory] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(cpu_row);
+                let [gpu, disks] =
+                    Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(device_row);
+
+                self.render_cpu(frame, cpu);
+                self.render_memory(frame, memory);
+                self.render_gpu(frame, gpu);
+                self.render_disks(frame, disks);
+            } else {
+                let kinds = compact_panels(area.width);
+                let constraints = vec![Constraint::Ratio(1, kinds.len() as u32); kinds.len()];
+                let chunks = Layout::horizontal(constraints).split(panels);
+
+                for (kind, chunk) in kinds.iter().zip(chunks.iter()) {
+                    self.render_panel(frame, *kind, *chunk);
+                }
+            }
+        }
 
         self.render_header(frame, header);
-        self.render_cpu(frame, cpu);
-        self.render_memory(frame, memory);
-        self.render_gpu(frame, gpu);
-        self.render_ssd(frame, ssd);
         self.render_processes(frame, processes);
         self.render_footer(frame, footer);
     }
 
+    fn render_panel(&self, frame: &mut Frame, kind: PanelKind, area: Rect) {
+        match kind {
+            PanelKind::Cpu => self.render_cpu(frame, area),
+            PanelKind::Memory => self.render_memory(frame, area),
+            PanelKind::Gpu => self.render_gpu(frame, area),
+            PanelKind::Disks => self.render_disks(frame, area),
+        }
+    }
+
     fn render_header(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
         let uptime = System::uptime();
         let hours = uptime / 3600;
         let minutes = uptime / 60 % 60;
 
-        let block = panel("");
-        let inner = block.inner(area);
-
-        frame.render_widget(block, area);
+        let inner = if area.height >= 3 {
+            let block = panel("");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            inner
+        } else {
+            area
+        };
 
         let [brand, system, uptime] = Layout::horizontal([
             Constraint::Length(9),
@@ -312,6 +382,10 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
         let key = |k: &'static str, desc: &'static str| {
             [
                 Span::styled(format!(" {k} "), Style::default().fg(ACCENT).bold()),
@@ -319,10 +393,15 @@ impl App {
             ]
         };
 
-        let spans: Vec<Span> = [key("↑/↓", "navigate"), key("s", "sort"), key("q", "quit")]
-            .into_iter()
-            .flatten()
-            .collect();
+        let mut spans: Vec<Span> = Vec::new();
+
+        if area.width >= 40 {
+            spans.extend(key("↑/↓", "navigate"));
+        }
+        if area.width >= 26 {
+            spans.extend(key("s", "sort"));
+        }
+        spans.extend(key("q", "quit"));
 
         frame.render_widget(Line::from(spans), area);
     }
@@ -338,15 +417,24 @@ impl App {
 
         frame.render_widget(block, area);
 
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
         let name = Line::from(Span::styled(
             self.cpu_name.as_str(),
             Style::default().fg(Color::White),
         ));
         let per_line = (inner.width as usize / 17).clamp(1, 4);
+        let max_lines = inner.height as usize;
 
         let mut lines = vec![name];
 
         for (chunk, cores) in self.system.cpus().chunks(per_line).enumerate() {
+            if lines.len() >= max_lines {
+                break;
+            }
+
             let mut spans = Vec::new();
 
             for (index, cpu) in cores.iter().enumerate() {
@@ -447,7 +535,7 @@ impl App {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn render_ssd(&self, frame: &mut Frame, area: Rect) {
+    fn render_disks(&self, frame: &mut Frame, area: Rect) {
         let rows = disk_rows(&self.disks);
 
         let block = panel("Disks");
@@ -490,38 +578,54 @@ impl App {
 
         frame.render_widget(block, area);
 
-        let header = Row::new([
-            Cell::from(Line::from("PID").alignment(Alignment::Right)),
-            Cell::from("NAME"),
-            Cell::from(Line::from("CPU%").alignment(Alignment::Right)),
-            Cell::from(Line::from("MEM").alignment(Alignment::Right)),
-        ])
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        let columns = process_columns(inner.width);
+        let selected = self.table_state.selected();
+
+        let header = Row::new(columns.iter().map(|column| {
+            let line = match column {
+                ProcessColumn::Pid => header_cell("PID", self.sort, SortBy::Pid, true),
+                ProcessColumn::User => Line::from("USER"),
+                ProcessColumn::Name => header_cell("NAME", self.sort, SortBy::Name, false),
+                ProcessColumn::Cpu => header_cell("CPU%", self.sort, SortBy::Cpu, true),
+                ProcessColumn::Memory => header_cell("MEM", self.sort, SortBy::Memory, true),
+            };
+
+            Cell::from(line)
+        }))
         .style(Style::default().fg(MUTED).bold());
 
-        let rows = self.processes.iter().map(|process| {
-            Row::new([
-                Cell::from(Line::from(process.pid.to_string()).alignment(Alignment::Right)),
-                Cell::from(process.name.clone()),
-                Cell::from(
-                    Line::from(Span::styled(
-                        format!("{:.1}", process.cpu),
-                        Style::default().fg(usage_color(process.cpu)),
-                    ))
-                    .alignment(Alignment::Right),
-                ),
-                Cell::from(
-                    Line::from(format!("{:.1} MiB", to_mib(process.memory)))
-                        .alignment(Alignment::Right),
-                ),
-            ])
+        let rows = self.processes.iter().enumerate().map(|(index, process)| {
+            let cpu_style = if selected == Some(index) {
+                Style::default()
+            } else {
+                Style::default().fg(usage_color(process.cpu))
+            };
+
+            Row::new(columns.iter().map(|column| {
+                match column {
+                    ProcessColumn::Pid => Cell::from(right(process.pid.to_string())),
+                    ProcessColumn::User => Cell::from(truncate(&process.user, 10)),
+                    ProcessColumn::Name => Cell::from(process.name.clone()),
+                    ProcessColumn::Cpu => Cell::from(
+                        Line::from(Span::styled(format!("{:.1}", process.cpu), cpu_style))
+                            .alignment(Alignment::Right),
+                    ),
+                    ProcessColumn::Memory => Cell::from(right(format_memory(process.memory))),
+                }
+            }))
         });
 
-        let widths = [
-            Constraint::Length(7),
-            Constraint::Fill(1),
-            Constraint::Length(7),
-            Constraint::Length(12),
-        ];
+        let widths = columns.iter().map(|column| match column {
+            ProcessColumn::Pid => Constraint::Length(7),
+            ProcessColumn::User => Constraint::Length(10),
+            ProcessColumn::Name => Constraint::Fill(1),
+            ProcessColumn::Cpu => Constraint::Length(7),
+            ProcessColumn::Memory => Constraint::Length(12),
+        });
 
         let table = Table::new(rows, widths)
             .header(header)
@@ -535,6 +639,106 @@ impl App {
             );
 
         frame.render_stateful_widget(table, inner, &mut self.table_state);
+    }
+}
+
+fn header_height(area: Rect) -> u16 {
+    if area.height < 4 {
+        0
+    } else if area.width >= 80 && area.height >= 28 {
+        3
+    } else {
+        1
+    }
+}
+
+fn panels_layout(area: Rect) -> (bool, u16) {
+    if area.width < 44 || area.height < 20 {
+        (false, 0)
+    } else if area.width >= 80 && area.height >= 28 {
+        (true, 18)
+    } else {
+        (false, 9)
+    }
+}
+
+fn compact_panels(width: u16) -> Vec<PanelKind> {
+    use PanelKind::*;
+
+    if width >= 100 {
+        vec![Cpu, Memory, Gpu, Disks]
+    } else if width >= 66 {
+        vec![Cpu, Memory, Gpu]
+    } else if width >= 44 {
+        vec![Cpu, Memory]
+    } else {
+        vec![Cpu]
+    }
+}
+
+fn process_columns(width: u16) -> Vec<ProcessColumn> {
+    use ProcessColumn::*;
+
+    if width >= 56 {
+        vec![Pid, User, Name, Cpu, Memory]
+    } else if width >= 42 {
+        vec![Pid, Name, Cpu, Memory]
+    } else if width >= 28 {
+        vec![Pid, Name, Cpu]
+    } else {
+        vec![Name, Cpu]
+    }
+}
+
+fn header_cell(label: &str, sort: SortBy, column: SortBy, right_aligned: bool) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        label.to_string(),
+        Style::default().fg(MUTED).bold(),
+    )];
+
+    if sort == column {
+        let arrow = if sort.descending() { "▼" } else { "▲" };
+        spans.push(Span::styled(
+            format!(" {arrow}"),
+            Style::default().fg(ACCENT).bold(),
+        ));
+    }
+
+    let line = Line::from(spans);
+
+    if right_aligned {
+        line.alignment(Alignment::Right)
+    } else {
+        line
+    }
+}
+
+fn right(text: impl Into<String>) -> Line<'static> {
+    Line::from(text.into()).alignment(Alignment::Right)
+}
+
+fn compare_processes(sort: SortBy, a: &ProcessRow, b: &ProcessRow) -> std::cmp::Ordering {
+    match sort {
+        SortBy::Cpu => b
+            .cpu
+            .total_cmp(&a.cpu)
+            .then_with(|| b.memory.cmp(&a.memory)),
+        SortBy::Memory => b
+            .memory
+            .cmp(&a.memory)
+            .then_with(|| b.cpu.total_cmp(&a.cpu)),
+        SortBy::Pid => a.pid.cmp(&b.pid),
+        SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    }
+}
+
+fn format_memory(bytes: u64) -> String {
+    let mib = to_mib(bytes);
+
+    if mib >= 1024.0 {
+        format!("{:.1} GiB", to_gib(bytes))
+    } else {
+        format!("{mib:.1} MiB")
     }
 }
 
@@ -593,16 +797,25 @@ fn bar_spans(usage: f32, width: usize) -> Vec<Span<'static>> {
 }
 
 fn meter(label: &str, usage: f32, detail: &str, width: u16) -> Line<'static> {
+    const MIN_BAR: usize = 6;
+
     let label = format!("{label:<6}");
     let percent = format!(" {:>3.0}%", usage);
-    let detail = if detail.is_empty() {
+    let mut detail = if detail.is_empty() {
         String::new()
     } else {
         format!("  {detail}")
     };
 
-    let reserved = label.chars().count() + percent.chars().count() + detail.chars().count();
-    let bar_width = (width as usize).saturating_sub(reserved).max(1);
+    let width = width as usize;
+    let fixed = label.chars().count() + percent.chars().count();
+
+    // Drop the detail on narrow panels so the meter stays readable.
+    if width < fixed + MIN_BAR + detail.chars().count() {
+        detail.clear();
+    }
+
+    let bar_width = width.saturating_sub(fixed + detail.chars().count()).max(1);
 
     let mut spans = vec![Span::styled(label, Style::default().fg(MUTED).bold())];
     spans.extend(bar_spans(usage, bar_width));
@@ -1037,6 +1250,124 @@ mod tests {
         assert!(is_pseudo_fs("tmpfs"));
         assert!(!is_pseudo_fs("btrfs"));
         assert!(!is_pseudo_fs("ext4"));
+    }
+
+    #[test]
+    fn format_memory_switches_units() {
+        assert_eq!(format_memory(512 * 1024 * 1024), "512.0 MiB");
+        assert_eq!(format_memory(2 * 1024 * 1024 * 1024), "2.0 GiB");
+    }
+
+    #[test]
+    fn process_columns_shrink_on_narrow_terminals() {
+        assert_eq!(
+            process_columns(120),
+            vec![
+                ProcessColumn::Pid,
+                ProcessColumn::User,
+                ProcessColumn::Name,
+                ProcessColumn::Cpu,
+                ProcessColumn::Memory
+            ]
+        );
+        assert_eq!(
+            process_columns(50),
+            vec![
+                ProcessColumn::Pid,
+                ProcessColumn::Name,
+                ProcessColumn::Cpu,
+                ProcessColumn::Memory
+            ]
+        );
+        assert_eq!(
+            process_columns(30),
+            vec![ProcessColumn::Pid, ProcessColumn::Name, ProcessColumn::Cpu]
+        );
+        assert_eq!(
+            process_columns(20),
+            vec![ProcessColumn::Name, ProcessColumn::Cpu]
+        );
+    }
+
+    #[test]
+    fn compact_panels_adapt_to_width() {
+        assert_eq!(compact_panels(120).len(), 4);
+        assert_eq!(compact_panels(80).len(), 3);
+        assert_eq!(compact_panels(50).len(), 2);
+        assert_eq!(compact_panels(40).len(), 1);
+    }
+
+    #[test]
+    fn panels_layout_scales_with_terminal() {
+        assert_eq!(panels_layout(Rect::new(0, 0, 120, 40)), (true, 18));
+        assert_eq!(panels_layout(Rect::new(0, 0, 80, 24)), (false, 9));
+        assert_eq!(panels_layout(Rect::new(0, 0, 40, 12)), (false, 0));
+    }
+
+    #[test]
+    fn header_shrinks_on_small_terminals() {
+        assert_eq!(header_height(Rect::new(0, 0, 120, 40)), 3);
+        assert_eq!(header_height(Rect::new(0, 0, 80, 24)), 1);
+        assert_eq!(header_height(Rect::new(0, 0, 40, 3)), 0);
+    }
+
+    #[test]
+    fn compares_processes_for_every_sort() {
+        let a = ProcessRow {
+            pid: 2,
+            user: "beta".into(),
+            name: "beta".into(),
+            cpu: 10.0,
+            memory: 500,
+        };
+        let b = ProcessRow {
+            pid: 1,
+            user: "alpha".into(),
+            name: "alpha".into(),
+            cpu: 20.0,
+            memory: 100,
+        };
+
+        assert_eq!(
+            compare_processes(SortBy::Cpu, &a, &b),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_processes(SortBy::Memory, &a, &b),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_processes(SortBy::Pid, &a, &b),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_processes(SortBy::Name, &a, &b),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn renders_across_terminal_sizes() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new();
+        let sizes = [
+            (12, 4),
+            (24, 8),
+            (30, 10),
+            (40, 12),
+            (60, 20),
+            (80, 24),
+            (100, 30),
+            (160, 48),
+        ];
+
+        for (width, height) in sizes {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            assert_eq!(terminal.backend().buffer().area.width, width);
+        }
     }
 
     #[test]
