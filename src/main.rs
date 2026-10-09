@@ -96,7 +96,7 @@ impl App {
 
         self.render_header(frame, header);
         self.render_cpu(frame, cpu);
-        frame.render_widget(panel("Memory"), memory);
+        self.render_memory(frame, memory);
         frame.render_widget(panel("History"), history);
         frame.render_widget(panel("Processes"), processes);
         self.render_footer(frame, footer)
@@ -148,6 +148,26 @@ impl App {
 
         let block = panel(&format!("CPU {average:.0}%"));
         frame.render_widget(Paragraph::new(lines).block(block), area);
+    }
+
+    fn render_memory(&mut self, frame: &mut Frame, area: Rect) {
+        let gib = |bytes: u64| bytes as f64 / 1024.0_f64.powi(3);
+        let sys = &self.system;
+
+        let lines = vec![
+            Line::from(format!(
+                "RAM {:.1}/{:.1} GiB",
+                gib(sys.used_memory()),
+                gib(sys.total_memory())
+            )),
+            Line::from(format!(
+                "Swap {:.1}/{:.1} GiB",
+                gib(sys.used_swap()),
+                gib(sys.total_swap())
+            )),
+        ];
+
+        frame.render_widget(Paragraph::new(lines).block(panel("Memory")), area);
     }
 }
 
