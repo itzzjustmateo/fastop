@@ -51,9 +51,11 @@ impl App {
             return;
         }
 
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.running = false,
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.running = false,
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.running = false,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.running = false;
+            }
             _ => {}
         }
     }
@@ -94,6 +96,7 @@ impl App {
 
         frame.render_widget(Paragraph::new(line).block(block), area);
     }
+
     fn render_footer(&mut self, frame: &mut Frame, area: Rect) {
         let key = |k: &'static str, desc: &'static str| {
             [
