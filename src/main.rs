@@ -2,12 +2,12 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use sysinfo::{Components, MINIMUM_CPU_UPDATE_INTERVAL, ProcessesToUpdate, System};
+use sysinfo::{Components, Disk, Disks, MINIMUM_CPU_UPDATE_INTERVAL, ProcessesToUpdate, System};
 
 const TICK_RATE: Duration = Duration::from_millis(500);
 const MUTED: Color = Color::DarkGray;
@@ -33,6 +33,13 @@ struct ProcessRow {
     name: String,
     cpu: f32,
     memory: u64,
+}
+
+struct DiskRow {
+    name: String,
+    label: String,
+    used: u64,
+    total: u64,
 }
 
 struct Gpu {
@@ -63,6 +70,7 @@ struct App {
     running: bool,
     system: System,
     components: Components,
+    disks: Disks,
     host_name: String,
     os_name: String,
     cpu_name: String,
@@ -92,6 +100,7 @@ impl App {
             running: true,
             system,
             components: Components::new_with_refreshed_list(),
+            disks: Disks::new_with_refreshed_list(),
             host_name: System::host_name().unwrap_or_else(|| "unknown".into()),
             os_name: System::long_os_version().unwrap_or_else(|| "unknown OS".into()),
             cpu_name,
@@ -178,6 +187,7 @@ impl App {
         self.system.refresh_memory();
         self.system.refresh_processes(ProcessesToUpdate::All, true);
         self.components.refresh(false);
+        self.disks.refresh(true);
 
         if let Some(gpu) = &mut self.gpu {
             gpu.refresh();
@@ -223,25 +233,30 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let [header, top, processes, footer] = Layout::vertical([
+        let [header, panels, processes, footer] = Layout::vertical([
             Constraint::Length(3),
-            Constraint::Length(12),
+            Constraint::Length(18),
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
         .areas(frame.area());
 
-        let [cpu, memory, gpu] = Layout::horizontal([
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ])
-        .areas(top);
+        let [cpu_row, device_row] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(panels);
+
+        let [cpu, memory] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(cpu_row);
+        let [gpu, ssd] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(device_row);
 
         self.render_header(frame, header);
         self.render_cpu(frame, cpu);
         self.render_memory(frame, memory);
         self.render_gpu(frame, gpu);
+        self.render_ssd(frame, ssd);
         self.render_processes(frame, processes);
         self.render_footer(frame, footer);
     }
@@ -257,7 +272,7 @@ impl App {
         frame.render_widget(block, area);
 
         let [brand, system, uptime] = Layout::horizontal([
-            Constraint::Length(10),
+            Constraint::Length(9),
             Constraint::Min(1),
             Constraint::Length(13),
         ])
@@ -265,7 +280,7 @@ impl App {
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" FASTOP", Style::default().fg(ACCENT).bold()),
+                Span::styled("FASTOP", Style::default().fg(ACCENT).bold()),
                 Span::styled(" • ", Style::default().fg(MUTED)),
             ])),
             brand,
@@ -323,15 +338,18 @@ impl App {
 
         frame.render_widget(block, area);
 
-        let mut lines = vec![Line::from(Span::styled(
+        let name = Line::from(Span::styled(
             self.cpu_name.as_str(),
-            Style::default().fg(MUTED),
-        ))];
+            Style::default().fg(Color::White),
+        ));
+        let per_line = (inner.width as usize / 17).clamp(1, 4);
 
-        for (chunk, pair) in self.system.cpus().chunks(2).enumerate() {
+        let mut lines = vec![name];
+
+        for (chunk, cores) in self.system.cpus().chunks(per_line).enumerate() {
             let mut spans = Vec::new();
 
-            for (index, cpu) in pair.iter().enumerate() {
+            for (index, cpu) in cores.iter().enumerate() {
                 if index > 0 {
                     spans.push(Span::raw("  "));
                 }
@@ -339,11 +357,11 @@ impl App {
                 let usage = cpu.cpu_usage();
 
                 spans.push(Span::styled(
-                    format!("C{:02} ", chunk * 2 + index),
+                    format!("C{:02} ", chunk * per_line + index),
                     Style::default().fg(MUTED),
                 ));
 
-                spans.extend(bar_spans(usage, 5));
+                spans.extend(bar_spans(usage, 6));
 
                 spans.push(Span::styled(
                     format!(" {:>3.0}%", usage),
@@ -365,37 +383,27 @@ impl App {
 
         frame.render_widget(block, area);
 
-        let ram_percent = percent(sys.used_memory(), sys.total_memory());
-        let swap_percent = percent(sys.used_swap(), sys.total_swap());
-
-        let mut ram_line = vec![Span::styled("RAM  ", Style::default().fg(MUTED).bold())];
-        ram_line.extend(bar_spans(ram_percent, 10));
-        ram_line.push(Span::styled(
-            format!(" {:>3.0}%", ram_percent),
-            Style::default().fg(usage_color(ram_percent)).bold(),
-        ));
-
-        let mut swap_line = vec![Span::styled("Swap ", Style::default().fg(MUTED).bold())];
-        swap_line.extend(bar_spans(swap_percent, 10));
-        swap_line.push(Span::styled(
-            format!(" {:>3.0}%", swap_percent),
-            Style::default().fg(usage_color(swap_percent)).bold(),
-        ));
-
         let lines = vec![
-            Line::from(ram_line),
-            Line::from(format!(
-                "      {:.1} / {:.1} GiB",
-                to_gib(sys.used_memory()),
-                to_gib(sys.total_memory())
-            )),
-            Line::from(""),
-            Line::from(swap_line),
-            Line::from(format!(
-                "      {:.1} / {:.1} GiB",
-                to_gib(sys.used_swap()),
-                to_gib(sys.total_swap())
-            )),
+            meter(
+                "RAM",
+                percent(sys.used_memory(), sys.total_memory()),
+                &format!(
+                    "{:.1} / {:.1} GiB",
+                    to_gib(sys.used_memory()),
+                    to_gib(sys.total_memory())
+                ),
+                inner.width,
+            ),
+            meter(
+                "Swap",
+                percent(sys.used_swap(), sys.total_swap()),
+                &format!(
+                    "{:.1} / {:.1} GiB",
+                    to_gib(sys.used_swap()),
+                    to_gib(sys.total_swap())
+                ),
+                inner.width,
+            ),
         ];
 
         frame.render_widget(Paragraph::new(lines), inner);
@@ -427,21 +435,46 @@ impl App {
             return;
         };
 
-        let mut usage = vec![Span::styled("GPU  ", Style::default().fg(MUTED).bold())];
-        usage.extend(bar_spans(gpu.usage, 12));
-        usage.push(Span::styled(
-            format!(" {:>3.0}%", gpu.usage),
-            Style::default().fg(usage_color(gpu.usage)).bold(),
-        ));
-
         let lines = vec![
             Line::from(Span::styled(
                 gpu.name.as_str(),
-                Style::default().fg(Color::White).bold(),
+                Style::default().fg(Color::White),
             )),
             Line::from(""),
-            Line::from(usage),
+            meter("GPU", gpu.usage, "", inner.width),
         ];
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_ssd(&self, frame: &mut Frame, area: Rect) {
+        let rows = disk_rows(&self.disks);
+
+        let block = panel("Disks");
+        let inner = block.inner(area);
+
+        frame.render_widget(block, area);
+
+        if rows.is_empty() {
+            let message = Paragraph::new(Line::from(Span::styled(
+                "No disks detected",
+                Style::default().fg(MUTED),
+            )));
+            frame.render_widget(message, inner);
+            return;
+        }
+
+        let lines = rows
+            .iter()
+            .map(|row| {
+                let label = format!("{:<8}", truncate(&row.label, 8));
+                let detail = format!(
+                    "{:<14}",
+                    format!("{:.0}/{:.0} GiB", to_gib(row.used), to_gib(row.total))
+                );
+                meter(&label, percent(row.used, row.total), &detail, inner.width)
+            })
+            .collect::<Vec<_>>();
 
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -508,7 +541,8 @@ impl App {
 fn panel(title: &str) -> Block<'static> {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(MUTED);
+        .border_style(MUTED)
+        .padding(Padding::horizontal(1));
 
     if title.is_empty() {
         block
@@ -526,14 +560,132 @@ fn usage_color(usage: f32) -> Color {
 }
 
 fn bar_spans(usage: f32, width: usize) -> Vec<Span<'static>> {
-    let usage = usage.clamp(0.0, 100.0);
-    let filled = (usage / 100.0 * width as f32).round() as usize;
-    let empty = width - filled;
+    const PARTIALS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 
-    vec![
-        Span::styled("█".repeat(filled), Style::default().fg(usage_color(usage))),
-        Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
-    ]
+    let usage = usage.clamp(0.0, 100.0);
+    let eighths = (usage / 100.0 * (width * 8) as f32).round() as usize;
+    let full = eighths / 8;
+    let remainder = eighths % 8;
+    let empty = width.saturating_sub(full + usize::from(remainder > 0));
+
+    let mut spans = Vec::with_capacity(3);
+
+    if full > 0 {
+        spans.push(Span::styled(
+            "█".repeat(full),
+            Style::default().fg(usage_color(usage)),
+        ));
+    }
+    if remainder > 0 {
+        spans.push(Span::styled(
+            PARTIALS[remainder - 1].to_string(),
+            Style::default().fg(usage_color(usage)),
+        ));
+    }
+    if empty > 0 {
+        spans.push(Span::styled(
+            "░".repeat(empty),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    spans
+}
+
+fn meter(label: &str, usage: f32, detail: &str, width: u16) -> Line<'static> {
+    let label = format!("{label:<6}");
+    let percent = format!(" {:>3.0}%", usage);
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!("  {detail}")
+    };
+
+    let reserved = label.chars().count() + percent.chars().count() + detail.chars().count();
+    let bar_width = (width as usize).saturating_sub(reserved).max(1);
+
+    let mut spans = vec![Span::styled(label, Style::default().fg(MUTED).bold())];
+    spans.extend(bar_spans(usage, bar_width));
+    spans.push(Span::styled(
+        percent,
+        Style::default().fg(usage_color(usage)).bold(),
+    ));
+    if !detail.is_empty() {
+        spans.push(Span::styled(detail, Style::default().fg(MUTED)));
+    }
+
+    Line::from(spans)
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.to_string()
+    } else {
+        let mut result: String = text.chars().take(width.saturating_sub(1)).collect();
+        result.push('…');
+        result
+    }
+}
+
+fn disk_rows(disks: &Disks) -> Vec<DiskRow> {
+    let mut rows: Vec<DiskRow> = Vec::new();
+
+    for disk in disks.list() {
+        if !is_real_disk(disk) {
+            continue;
+        }
+
+        let name = disk.name().to_string_lossy().into_owned();
+        let mount = disk.mount_point().to_string_lossy().into_owned();
+        let used = disk.total_space().saturating_sub(disk.available_space());
+
+        if let Some(row) = rows.iter_mut().find(|row| row.name == name) {
+            if mount.len() < row.label.len() {
+                row.label = mount;
+            }
+            continue;
+        }
+
+        rows.push(DiskRow {
+            name,
+            label: mount,
+            used,
+            total: disk.total_space(),
+        });
+    }
+
+    rows.sort_by_key(|row| std::cmp::Reverse(row.total));
+    rows
+}
+
+fn is_real_disk(disk: &Disk) -> bool {
+    disk.total_space() > 0 && !is_pseudo_fs(&disk.file_system().to_string_lossy())
+}
+
+fn is_pseudo_fs(file_system: &str) -> bool {
+    matches!(
+        file_system,
+        "overlay"
+            | "tmpfs"
+            | "devtmpfs"
+            | "squashfs"
+            | "proc"
+            | "sysfs"
+            | "ramfs"
+            | "autofs"
+            | "cgroup"
+            | "cgroup2"
+            | "devpts"
+            | "debugfs"
+            | "tracefs"
+            | "securityfs"
+            | "configfs"
+            | "fusectl"
+            | "mqueue"
+            | "hugetlbfs"
+            | "bpf"
+            | "binfmt_misc"
+    )
 }
 
 fn percent(used: u64, total: u64) -> f32 {
@@ -847,17 +999,44 @@ mod tests {
         assert_eq!(to_mib(1024_u64.pow(2)), 1.0);
     }
 
+    fn bar_text(usage: f32, width: usize) -> String {
+        bar_spans(usage, width)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn bar_spans_fill_proportionally() {
-        let spans = bar_spans(50.0, 10);
-        assert_eq!(spans[0].content.as_ref(), "█████");
-        assert_eq!(spans[1].content.as_ref(), "░░░░░");
+        assert_eq!(bar_text(50.0, 10), "█████░░░░░");
+        assert_eq!(bar_text(50.0, 10).chars().count(), 10);
     }
 
     #[test]
     fn bar_spans_clamp_out_of_range_values() {
-        assert_eq!(bar_spans(-10.0, 10)[0].content, "");
-        assert_eq!(bar_spans(150.0, 10)[1].content, "");
+        assert_eq!(bar_text(-10.0, 10), "░░░░░░░░░░");
+        assert_eq!(bar_text(150.0, 10), "██████████");
+    }
+
+    #[test]
+    fn bar_spans_render_partial_blocks() {
+        // 5% of a 10-cell bar is half of one cell.
+        assert_eq!(bar_text(5.0, 10), "▌░░░░░░░░░");
+        assert_eq!(bar_text(5.0, 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn truncate_keeps_short_and_shortens_long() {
+        assert_eq!(truncate("/boot", 8), "/boot");
+        assert_eq!(truncate("/very/long/mount", 8), "/very/l…");
+    }
+
+    #[test]
+    fn filters_pseudo_filesystems() {
+        assert!(is_pseudo_fs("overlay"));
+        assert!(is_pseudo_fs("tmpfs"));
+        assert!(!is_pseudo_fs("btrfs"));
+        assert!(!is_pseudo_fs("ext4"));
     }
 
     #[test]
