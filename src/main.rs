@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, ProcessesToUpdate, System};
 
@@ -33,11 +34,19 @@ struct ProcessRow {
     memory: u64,
 }
 
+struct Gpu {
+    name: String,
+    usage_path: Option<PathBuf>,
+    usage: f32,
+}
+
 struct App {
     running: bool,
     system: System,
     host_name: String,
     os_name: String,
+    cpu_name: String,
+    gpu: Option<Gpu>,
     processes: Vec<ProcessRow>,
     table_state: TableState,
     sort: SortBy,
@@ -53,11 +62,19 @@ impl App {
         std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
         system.refresh_cpu_usage();
 
+        let cpu_name = system
+            .cpus()
+            .first()
+            .map_or_else(|| "Unknown CPU".to_string(), |cpu| cpu.brand().to_string());
+        let gpu = Gpu::detect();
+
         let mut app = Self {
             running: true,
             system,
             host_name: System::host_name().unwrap_or_else(|| "unknown".into()),
             os_name: System::long_os_version().unwrap_or_else(|| "unknown OS".into()),
+            cpu_name,
+            gpu,
             processes: Vec::new(),
             table_state: TableState::default(),
             sort: SortBy::Cpu,
@@ -139,6 +156,11 @@ impl App {
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
         self.system.refresh_processes(ProcessesToUpdate::All, true);
+
+        if let Some(gpu) = &mut self.gpu {
+            gpu.refresh();
+        }
+
         self.update_process_list();
     }
 
@@ -179,22 +201,25 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let [header, top, history, processes, footer] = Layout::vertical([
+        let [header, top, processes, footer] = Layout::vertical([
             Constraint::Length(3),
-            Constraint::Length(10),
-            Constraint::Length(10),
+            Constraint::Length(12),
             Constraint::Fill(1),
             Constraint::Length(1),
         ])
         .areas(frame.area());
 
-        let [cpu, memory] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top);
+        let [cpu, memory, gpu] = Layout::horizontal([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .areas(top);
 
         self.render_header(frame, header);
         self.render_cpu(frame, cpu);
         self.render_memory(frame, memory);
-        frame.render_widget(panel("History"), history);
+        self.render_gpu(frame, gpu);
         self.render_processes(frame, processes);
         self.render_footer(frame, footer);
     }
@@ -272,9 +297,12 @@ impl App {
 
         frame.render_widget(block, area);
 
-        let mut lines = Vec::new();
+        let mut lines = vec![Line::from(Span::styled(
+            self.cpu_name.as_str(),
+            Style::default().fg(MUTED),
+        ))];
 
-        for pair in self.system.cpus().chunks(2) {
+        for (chunk, pair) in self.system.cpus().chunks(2).enumerate() {
             let mut spans = Vec::new();
 
             for (index, cpu) in pair.iter().enumerate() {
@@ -285,7 +313,7 @@ impl App {
                 let usage = cpu.cpu_usage();
 
                 spans.push(Span::styled(
-                    format!("C{:02} ", lines.len() * 2 + index),
+                    format!("C{:02} ", chunk * 2 + index),
                     Style::default().fg(MUTED),
                 ));
 
@@ -342,6 +370,43 @@ impl App {
                 to_gib(sys.used_swap()),
                 to_gib(sys.total_swap())
             )),
+        ];
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_gpu(&self, frame: &mut Frame, area: Rect) {
+        let block = match &self.gpu {
+            Some(gpu) => panel(&format!("GPU {:.0}%", gpu.usage)),
+            None => panel("GPU"),
+        };
+        let inner = block.inner(area);
+
+        frame.render_widget(block, area);
+
+        let Some(gpu) = &self.gpu else {
+            let message = Paragraph::new(Line::from(Span::styled(
+                "No GPU detected",
+                Style::default().fg(MUTED),
+            )));
+            frame.render_widget(message, inner);
+            return;
+        };
+
+        let mut usage = vec![Span::styled("GPU  ", Style::default().fg(MUTED).bold())];
+        usage.extend(bar_spans(gpu.usage, 12));
+        usage.push(Span::styled(
+            format!(" {:>3.0}%", gpu.usage),
+            Style::default().fg(usage_color(gpu.usage)).bold(),
+        ));
+
+        let lines = vec![
+            Line::from(Span::styled(
+                gpu.name.as_str(),
+                Style::default().fg(Color::White).bold(),
+            )),
+            Line::from(""),
+            Line::from(usage),
         ];
 
         frame.render_widget(Paragraph::new(lines), inner);
@@ -453,6 +518,123 @@ fn to_mib(bytes: u64) -> f64 {
     bytes as f64 / 1024.0_f64.powi(2)
 }
 
+impl Gpu {
+    #[cfg(target_os = "linux")]
+    fn detect() -> Option<Self> {
+        let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+        let mut fallback = None;
+
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+
+            if !is_drm_card(&name) {
+                continue;
+            }
+
+            let device = entry.path().join("device");
+            if !device.is_dir() {
+                continue;
+            }
+
+            let usage_path = device.join("gpu_busy_percent");
+            let has_usage = usage_path.exists();
+            let name = gpu_name_from_device(&device).unwrap_or_else(|| "Unknown GPU".to_string());
+
+            let mut gpu = Gpu {
+                name,
+                usage_path: has_usage.then_some(usage_path),
+                usage: 0.0,
+            };
+
+            if has_usage {
+                gpu.refresh();
+                return Some(gpu);
+            }
+
+            fallback.get_or_insert(gpu);
+        }
+
+        fallback
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detect() -> Option<Self> {
+        None
+    }
+
+    fn refresh(&mut self) {
+        if let Some(path) = &self.usage_path
+            && let Ok(value) = std::fs::read_to_string(path)
+            && let Ok(usage) = value.trim().parse::<f32>()
+        {
+            self.usage = usage;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_drm_card(name: &str) -> bool {
+    name.strip_prefix("card")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+#[cfg(target_os = "linux")]
+fn gpu_name_from_device(device: &std::path::Path) -> Option<String> {
+    let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
+    let pci_id = uevent
+        .lines()
+        .find_map(|line| line.strip_prefix("PCI_ID="))?;
+    let (vendor, device) = pci_id.split_once(':')?;
+
+    let vendor = u16::from_str_radix(vendor.trim(), 16).ok()?;
+    let device = u16::from_str_radix(device.trim(), 16).ok()?;
+
+    lookup_pci_name(vendor, device)
+}
+
+#[cfg(target_os = "linux")]
+fn lookup_pci_name(vendor: u16, device: u16) -> Option<String> {
+    const PCI_IDS_PATHS: [&str; 3] = [
+        "/usr/share/hwdata/pci.ids",
+        "/usr/share/misc/pci.ids",
+        "/var/lib/pciutils/pci.ids",
+    ];
+
+    for path in PCI_IDS_PATHS {
+        if let Ok(contents) = std::fs::read_to_string(path)
+            && let Some(name) = parse_pci_ids(&contents, vendor, device)
+        {
+            return Some(name);
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_pci_ids(contents: &str, vendor: u16, device: u16) -> Option<String> {
+    let vendor_line = format!("{vendor:04x}  ");
+    let device_line = format!("\t{device:04x}  ");
+    let mut in_vendor = false;
+
+    for line in contents.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with('\t') {
+            if in_vendor && let Some(name) = line.strip_prefix(&device_line) {
+                return Some(name.trim().to_string());
+            }
+        } else {
+            in_vendor = line.starts_with(&vendor_line);
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +684,39 @@ mod tests {
     fn bar_spans_clamp_out_of_range_values() {
         assert_eq!(bar_spans(-10.0, 10)[0].content, "");
         assert_eq!(bar_spans(150.0, 10)[1].content, "");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recognizes_drm_card_names() {
+        assert!(is_drm_card("card0"));
+        assert!(is_drm_card("card12"));
+        assert!(!is_drm_card("card"));
+        assert!(!is_drm_card("card0-DP-1"));
+        assert!(!is_drm_card("renderD128"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_pci_ids_entry() {
+        let contents = concat!(
+            "# comment\n",
+            "1002  Advanced Micro Devices, Inc. [AMD/ATI]\n",
+            "\t1638  Cezanne [Radeon Vega Series]\n",
+            "\t9999  Some Other Device\n",
+            "8086  Intel Corporation\n",
+            "\t1234  Intel Device\n",
+        );
+
+        assert_eq!(
+            parse_pci_ids(contents, 0x1002, 0x1638).as_deref(),
+            Some("Cezanne [Radeon Vega Series]")
+        );
+        assert_eq!(
+            parse_pci_ids(contents, 0x8086, 0x1234).as_deref(),
+            Some("Intel Device")
+        );
+        assert_eq!(parse_pci_ids(contents, 0x1002, 0x0000), None);
+        assert_eq!(parse_pci_ids(contents, 0x10de, 0x1638), None);
     }
 }
