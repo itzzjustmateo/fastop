@@ -5,8 +5,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, ProcessesToUpdate, System};
+use sysinfo::{Components, MINIMUM_CPU_UPDATE_INTERVAL, ProcessesToUpdate, System};
 
 const TICK_RATE: Duration = Duration::from_millis(500);
 const MUTED: Color = Color::DarkGray;
@@ -36,13 +37,32 @@ struct ProcessRow {
 
 struct Gpu {
     name: String,
-    usage_path: Option<PathBuf>,
     usage: f32,
+    temperature: Option<f32>,
+    backend: GpuBackend,
+}
+
+enum GpuBackend {
+    Sysfs {
+        usage_path: PathBuf,
+        temperature_path: Option<PathBuf>,
+    },
+    NvidiaSmi(NvidiaShared),
+}
+
+#[derive(Clone, Default)]
+struct NvidiaShared(Arc<Mutex<Option<NvidiaSample>>>);
+
+#[derive(Clone, Copy)]
+struct NvidiaSample {
+    usage: f32,
+    temperature: Option<f32>,
 }
 
 struct App {
     running: bool,
     system: System,
+    components: Components,
     host_name: String,
     os_name: String,
     cpu_name: String,
@@ -71,6 +91,7 @@ impl App {
         let mut app = Self {
             running: true,
             system,
+            components: Components::new_with_refreshed_list(),
             host_name: System::host_name().unwrap_or_else(|| "unknown".into()),
             os_name: System::long_os_version().unwrap_or_else(|| "unknown OS".into()),
             cpu_name,
@@ -156,6 +177,7 @@ impl App {
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
         self.system.refresh_processes(ProcessesToUpdate::All, true);
+        self.components.refresh(false);
 
         if let Some(gpu) = &mut self.gpu {
             gpu.refresh();
@@ -243,7 +265,7 @@ impl App {
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("FASTOP", Style::default().fg(ACCENT).bold()),
+                Span::styled(" FASTOP", Style::default().fg(ACCENT).bold()),
                 Span::styled(" • ", Style::default().fg(MUTED)),
             ])),
             brand,
@@ -292,7 +314,11 @@ impl App {
 
     fn render_cpu(&self, frame: &mut Frame, area: Rect) {
         let average = self.system.global_cpu_usage();
-        let block = panel(&format!("CPU {average:.0}%"));
+        let title = match cpu_temperature(&self.components) {
+            Some(temperature) => format!("CPU {average:.0}% · {temperature:.0}°C"),
+            None => format!("CPU {average:.0}%"),
+        };
+        let block = panel(&title);
         let inner = block.inner(area);
 
         frame.render_widget(block, area);
@@ -377,7 +403,15 @@ impl App {
 
     fn render_gpu(&self, frame: &mut Frame, area: Rect) {
         let block = match &self.gpu {
-            Some(gpu) => panel(&format!("GPU {:.0}%", gpu.usage)),
+            Some(gpu) => {
+                let title = match gpu.temperature {
+                    Some(temperature) => {
+                        format!("GPU {:.0}% · {temperature:.0}°C", gpu.usage)
+                    }
+                    None => format!("GPU {:.0}%", gpu.usage),
+                };
+                panel(&title)
+            }
             None => panel("GPU"),
         };
         let inner = block.inner(area);
@@ -519,14 +553,16 @@ fn to_mib(bytes: u64) -> f64 {
 }
 
 impl Gpu {
-    #[cfg(target_os = "linux")]
     fn detect() -> Option<Self> {
+        Self::detect_sysfs().or_else(Self::detect_nvidia)
+    }
+
+    fn detect_sysfs() -> Option<Self> {
         let entries = std::fs::read_dir("/sys/class/drm").ok()?;
-        let mut fallback = None;
 
         for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
 
             if !is_drm_card(&name) {
                 continue;
@@ -538,48 +574,86 @@ impl Gpu {
             }
 
             let usage_path = device.join("gpu_busy_percent");
-            let has_usage = usage_path.exists();
-            let name = gpu_name_from_device(&device).unwrap_or_else(|| "Unknown GPU".to_string());
-
-            let mut gpu = Gpu {
-                name,
-                usage_path: has_usage.then_some(usage_path),
-                usage: 0.0,
-            };
-
-            if has_usage {
-                gpu.refresh();
-                return Some(gpu);
+            if !usage_path.exists() {
+                continue;
             }
 
-            fallback.get_or_insert(gpu);
+            let mut gpu = Gpu {
+                name: gpu_name_from_device(&device).unwrap_or_else(|| "Unknown GPU".to_string()),
+                usage: 0.0,
+                temperature: None,
+                backend: GpuBackend::Sysfs {
+                    usage_path,
+                    temperature_path: gpu_temperature_path(&device),
+                },
+            };
+            gpu.refresh();
+
+            return Some(gpu);
         }
 
-        fallback
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn detect() -> Option<Self> {
         None
     }
 
+    fn detect_nvidia() -> Option<Self> {
+        let first = query_nvidia_smi()?;
+        let shared = spawn_nvidia_poller();
+
+        Some(Gpu {
+            name: first.name,
+            usage: first.usage,
+            temperature: first.temperature,
+            backend: GpuBackend::NvidiaSmi(shared),
+        })
+    }
+
     fn refresh(&mut self) {
-        if let Some(path) = &self.usage_path
-            && let Ok(value) = std::fs::read_to_string(path)
-            && let Ok(usage) = value.trim().parse::<f32>()
-        {
-            self.usage = usage;
+        match &self.backend {
+            GpuBackend::Sysfs {
+                usage_path,
+                temperature_path,
+            } => {
+                if let Some(usage) = read_number(usage_path) {
+                    self.usage = usage as f32;
+                }
+
+                self.temperature = temperature_path
+                    .as_ref()
+                    .and_then(|path| read_number(path))
+                    .map(|milli| (milli / 1000.0) as f32);
+            }
+            GpuBackend::NvidiaSmi(shared) => {
+                if let Ok(sample) = shared.0.lock()
+                    && let Some(sample) = *sample
+                {
+                    self.usage = sample.usage;
+                    self.temperature = sample.temperature;
+                }
+            }
         }
     }
 }
 
-#[cfg(target_os = "linux")]
 fn is_drm_card(name: &str) -> bool {
     name.strip_prefix("card")
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
-#[cfg(target_os = "linux")]
+fn read_number(path: &std::path::Path) -> Option<f64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn gpu_temperature_path(device: &std::path::Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(device.join("hwmon")).ok()?.flatten() {
+        let temperature = entry.path().join("temp1_input");
+        if temperature.exists() {
+            return Some(temperature);
+        }
+    }
+
+    None
+}
+
 fn gpu_name_from_device(device: &std::path::Path) -> Option<String> {
     let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
     let pci_id = uevent
@@ -593,7 +667,6 @@ fn gpu_name_from_device(device: &std::path::Path) -> Option<String> {
     lookup_pci_name(vendor, device)
 }
 
-#[cfg(target_os = "linux")]
 fn lookup_pci_name(vendor: u16, device: u16) -> Option<String> {
     const PCI_IDS_PATHS: [&str; 3] = [
         "/usr/share/hwdata/pci.ids",
@@ -612,7 +685,6 @@ fn lookup_pci_name(vendor: u16, device: u16) -> Option<String> {
     None
 }
 
-#[cfg(target_os = "linux")]
 fn parse_pci_ids(contents: &str, vendor: u16, device: u16) -> Option<String> {
     let vendor_line = format!("{vendor:04x}  ");
     let device_line = format!("\t{device:04x}  ");
@@ -633,6 +705,108 @@ fn parse_pci_ids(contents: &str, vendor: u16, device: u16) -> Option<String> {
     }
 
     None
+}
+
+struct NvidiaQuery {
+    name: String,
+    usage: f32,
+    temperature: Option<f32>,
+}
+
+const NVIDIA_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+fn spawn_nvidia_poller() -> NvidiaShared {
+    let shared = NvidiaShared::default();
+    let worker = shared.clone();
+
+    std::thread::spawn(move || {
+        loop {
+            let Some(query) = query_nvidia_smi() else {
+                return;
+            };
+
+            *worker.0.lock().unwrap() = Some(NvidiaSample {
+                usage: query.usage,
+                temperature: query.temperature,
+            });
+
+            std::thread::sleep(NVIDIA_POLL_INTERVAL);
+        }
+    });
+
+    shared
+}
+
+fn query_nvidia_smi() -> Option<NvidiaQuery> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,utilization.gpu,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_nvidia_smi(stdout.lines().next()?)
+}
+
+fn parse_nvidia_smi(line: &str) -> Option<NvidiaQuery> {
+    let mut fields = line.split(',').map(str::trim);
+
+    let name = fields.next()?;
+    if name.is_empty() {
+        return None;
+    }
+
+    let usage = fields.next()?.parse::<f32>().ok()?;
+    let temperature = fields.next().and_then(|value| value.parse::<f32>().ok());
+
+    Some(NvidiaQuery {
+        name: name.to_string(),
+        usage,
+        temperature,
+    })
+}
+
+fn cpu_temperature(components: &Components) -> Option<f32> {
+    let mut best: Option<(u8, f32)> = None;
+
+    for component in components.iter() {
+        let Some(temperature) = component.temperature() else {
+            continue;
+        };
+        let Some(score) = cpu_temperature_score(component.label()) else {
+            continue;
+        };
+
+        if best.is_none_or(|(current, _)| score > current) {
+            best = Some((score, temperature));
+        }
+    }
+
+    best.map(|(_, temperature)| temperature)
+}
+
+fn cpu_temperature_score(label: &str) -> Option<u8> {
+    let label = label.to_ascii_lowercase();
+
+    if ["package", "tctl", "tdie"]
+        .into_iter()
+        .any(|needle| label.contains(needle))
+    {
+        Some(3)
+    } else if ["k10temp", "coretemp", "zenpower", "cpu"]
+        .into_iter()
+        .any(|needle| label.contains(needle))
+    {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -686,7 +860,6 @@ mod tests {
         assert_eq!(bar_spans(150.0, 10)[1].content, "");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn recognizes_drm_card_names() {
         assert!(is_drm_card("card0"));
@@ -696,7 +869,6 @@ mod tests {
         assert!(!is_drm_card("renderD128"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn parses_pci_ids_entry() {
         let contents = concat!(
@@ -718,5 +890,30 @@ mod tests {
         );
         assert_eq!(parse_pci_ids(contents, 0x1002, 0x0000), None);
         assert_eq!(parse_pci_ids(contents, 0x10de, 0x1638), None);
+    }
+
+    #[test]
+    fn parses_nvidia_smi_output() {
+        let query = parse_nvidia_smi("NVIDIA GeForce RTX 3080, 42, 65").unwrap();
+        assert_eq!(query.name, "NVIDIA GeForce RTX 3080");
+        assert_eq!(query.usage, 42.0);
+        assert_eq!(query.temperature, Some(65.0));
+
+        let no_temperature = parse_nvidia_smi("NVIDIA GeForce RTX 3080, 42, [N/A]").unwrap();
+        assert_eq!(no_temperature.temperature, None);
+
+        assert!(parse_nvidia_smi("").is_none());
+        assert!(parse_nvidia_smi("OnlyName").is_none());
+        assert!(parse_nvidia_smi("GPU, not-a-number, 50").is_none());
+    }
+
+    #[test]
+    fn scores_cpu_temperature_labels() {
+        assert_eq!(cpu_temperature_score("k10temp Tctl"), Some(3));
+        assert_eq!(cpu_temperature_score("Package id 0"), Some(3));
+        assert_eq!(cpu_temperature_score("coretemp Core 0"), Some(2));
+        assert_eq!(cpu_temperature_score("zenpower"), Some(2));
+        assert_eq!(cpu_temperature_score("amdgpu edge"), None);
+        assert_eq!(cpu_temperature_score("nvme Composite"), None);
     }
 }
