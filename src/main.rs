@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::time::{Duration, Instant};
+use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, System};
 
 const TICK_RATE: Duration = Duration::from_millis(500);
 const MUTED: Color = Color::DarkGray;
@@ -12,6 +13,9 @@ const ACCENT: Color = Color::Cyan;
 
 struct App {
     running: bool,
+    system: System,
+    host_name: String,
+    os_name: String,
 }
 
 fn main() -> std::io::Result<()> {
@@ -20,7 +24,19 @@ fn main() -> std::io::Result<()> {
 
 impl App {
     fn new() -> Self {
-        Self { running: true }
+        let mut system = System::new_all();
+        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
+        system.refresh_cpu_usage();
+
+        let mut app = Self {
+            running: true,
+            system,
+            host_name: System::host_name().unwrap_or_else(|| "unknown".into()),
+            os_name: System::long_os_version().unwrap_or_else(|| "unknown OS".into()),
+        };
+
+        app.on_tick();
+        app
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
@@ -60,7 +76,10 @@ impl App {
         }
     }
 
-    fn on_tick(&mut self) {}
+    fn on_tick(&mut self) {
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+    }
 
     fn render(&mut self, frame: &mut Frame) {
         let [header, top, history, processes, footer] = Layout::vertical([
@@ -85,10 +104,14 @@ impl App {
 
     fn render_header(&mut self, frame: &mut Frame, area: Rect) {
         let sep = Span::styled(" | ", MUTED);
+        let uptime = System::uptime();
+
         let line = Line::from(vec![
             " Fastop".bold().fg(ACCENT),
-            sep,
-            Span::raw("Live System Monitor"),
+            sep.clone(),
+            self.host_name.clone().bold(),
+            sep.clone(),
+            Span::raw(format!("Up {}h {}m", uptime / 3600, uptime % 3600 / 60)),
         ]);
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
