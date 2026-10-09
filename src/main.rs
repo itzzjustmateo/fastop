@@ -95,7 +95,7 @@ impl App {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top);
 
         self.render_header(frame, header);
-        frame.render_widget(panel("CPU"), cpu);
+        self.render_cpu(frame, cpu);
         frame.render_widget(panel("Memory"), memory);
         frame.render_widget(panel("History"), history);
         frame.render_widget(panel("Processes"), processes);
@@ -108,6 +108,8 @@ impl App {
 
         let line = Line::from(vec![
             " Fastop".bold().fg(ACCENT),
+            sep.clone(),
+            self.os_name.clone().bold(),
             sep.clone(),
             self.host_name.clone().bold(),
             sep.clone(),
@@ -131,6 +133,21 @@ impl App {
         let spans: Vec<Span> = [key("q", "quit")].into_iter().flatten().collect();
 
         frame.render_widget(Line::from(spans), area);
+    }
+
+    fn render_cpu(&mut self, frame: &mut Frame, area: Rect) {
+        let average = self.system.global_cpu_usage();
+
+        let lines: Vec<Line> = self
+            .system
+            .cpus()
+            .iter()
+            .enumerate()
+            .map(|(i, cpu)| Line::from(format!("core {i:>2}\t{:>3.0}%", cpu.cpu_usage())))
+            .collect();
+
+        let block = panel(&format!("CPU {average:.0}%"));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 }
 
