@@ -1,5 +1,6 @@
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::widgets::Paragraph;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::time::{Duration, Instant};
 
@@ -7,8 +8,6 @@ const TICK_RATE: Duration = Duration::from_millis(500);
 
 struct App {
     running: bool,
-    ticks: u64,
-    key_presses: u64,
 }
 
 fn main() -> std::io::Result<()> {
@@ -17,11 +16,7 @@ fn main() -> std::io::Result<()> {
 
 impl App {
     fn new() -> Self {
-        Self {
-            running: true,
-            ticks: 0,
-            key_presses: 0,
-        }
+        Self { running: true }
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
@@ -51,7 +46,6 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        self.key_presses += 1;
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
@@ -59,16 +53,26 @@ impl App {
         }
     }
 
-    fn on_tick(&mut self) {
-        self.ticks += 1;
-    }
+    fn on_tick(&mut self) {}
 
     fn render(&mut self, frame: &mut Frame) {
-        let text = format!(
-            "FastTop is alive! ticks: #{}, key presses: #{}",
-            self.ticks, self.key_presses
-        );
+        let [header, top, history, processes, footer] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
 
-        frame.render_widget(Paragraph::new(text), frame.area());
+        let [cpu, memory] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top);
+
+        frame.render_widget(Block::bordered().title("Fastop"), header);
+        frame.render_widget(Block::bordered().title("CPU"), cpu);
+        frame.render_widget(Block::bordered().title("Memory"), memory);
+        frame.render_widget(Block::bordered().title("History"), history);
+        frame.render_widget(Block::bordered().title("Processes"), processes);
+        frame.render_widget(Paragraph::new("q quit"), footer);
     }
 }
