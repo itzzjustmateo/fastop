@@ -1,1 +1,19 @@
+# Rust / Cargo
 /target
+**/*.rs.bk
+
+# AI tooling (never commit)
+/.opencode
+/.claude
+/.gemini
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
