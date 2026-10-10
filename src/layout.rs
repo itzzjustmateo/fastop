@@ -15,6 +15,7 @@ pub(crate) enum PanelKind {
     Gpu,
     Disks,
     Network,
+    Battery,
 }
 
 /// Height reserved for the header (0, 1 or 3 lines).
@@ -49,7 +50,9 @@ pub(crate) fn panels_layout(area: Rect, mode: LayoutMode) -> (bool, u16) {
 pub(crate) fn compact_panels(width: u16) -> Vec<PanelKind> {
     use PanelKind::*;
 
-    if width >= 108 {
+    if width >= 132 {
+        vec![Cpu, Memory, Gpu, Disks, Network, Battery]
+    } else if width >= 108 {
         vec![Cpu, Memory, Gpu, Disks, Network]
     } else if width >= 88 {
         vec![Cpu, Memory, Gpu, Network]
@@ -68,6 +71,7 @@ mod tests {
 
     #[test]
     fn compact_panels_adapt_to_width() {
+        assert_eq!(compact_panels(140).len(), 6);
         assert_eq!(compact_panels(120).len(), 5);
         assert_eq!(compact_panels(100).len(), 4);
         assert_eq!(compact_panels(80).len(), 3);

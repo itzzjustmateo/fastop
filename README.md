@@ -4,11 +4,12 @@ A *fast, lightweight* alternative to [btop](https://github.com/aristocratos/btop
 
 ## Features
 
-- CPU panel with per-core bars and package temperature
+- CPU panel with per-core bars, a package temperature gauge and a history graph
 - Memory and swap meters
-- GPU usage and temperature (sysfs, with an `nvidia-smi` fallback)
+- GPU usage plus a temperature gauge and history graph (sysfs, with an `nvidia-smi` fallback)
 - Disk usage per physical device
 - Network throughput per interface (download/upload rates)
+- Battery charge, state and time remaining (shown when a battery is present)
 - Process table with selection and sortable columns (`s` cycles CPU → MEM → PID → NAME)
 - Responsive layout: full 2×2 grid on large terminals, a single compact row on smaller ones
 
@@ -84,11 +85,13 @@ cargo fmt
 | `app.rs` | Application state, event loop and top-level render
 | `panels.rs` | Rendering for each panel (header, footer, CPU, memory, …)
 | `layout.rs` | Panel selection and responsive layout decisions |
-| `theme.rs` | Color constants and usage coloring |
+| `theme.rs` | Color constants and threshold-based coloring |
 | `widgets.rs` | Reusable UI primitives (panels, meters, bars) |
 | `format.rs` | Byte/rate/percentage formatting helpers |
 | `processes.rs` | Process rows, columns and sorting |
 | `disks.rs` | Disk enumeration and filtering |
 | `network.rs` | Network interface filtering and rows |
 | `gpu.rs` | GPU detection and sampling |
+| `battery.rs` | Battery detection and snapshots |
+| `temperature.rs` | Rolling temperature history for the graphs |
 | `sensors.rs` | CPU temperature selection |

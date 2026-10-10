@@ -1,4 +1,5 @@
 mod app;
+mod battery;
 mod cli;
 mod config;
 mod disks;
@@ -9,6 +10,7 @@ mod network;
 mod panels;
 mod processes;
 mod sensors;
+mod temperature;
 mod theme;
 mod widgets;
 

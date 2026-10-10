@@ -7,11 +7,19 @@ use sysinfo::{
     Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, ProcessesToUpdate, System, Users,
 };
 
+use crate::battery::BatteryMonitor;
 use crate::cli::LayoutMode;
 use crate::gpu::Gpu;
 use crate::layout::{PanelKind, compact_panels, header_height, panels_layout};
 use crate::network::{NetworkRow, is_network_interface};
 use crate::processes::{ProcessRow, SortBy, compare_processes};
+use crate::sensors::cpu_temperature;
+use crate::temperature::TemperatureHistory;
+
+/// Number of temperature samples kept for the CPU/GPU sparkline graphs.
+const TEMPERATURE_HISTORY: usize = 120;
+/// Width reserved for the battery panel in the grid layout.
+const BATTERY_WIDTH: u16 = 32;
 
 /// All application state and the event loop.
 pub(crate) struct App {
@@ -27,6 +35,10 @@ pub(crate) struct App {
     pub(crate) os_name: String,
     pub(crate) cpu_name: String,
     pub(crate) gpu: Option<Gpu>,
+    pub(crate) cpu_temp: Option<f32>,
+    pub(crate) cpu_temp_history: TemperatureHistory,
+    pub(crate) gpu_temp_history: TemperatureHistory,
+    pub(crate) battery: BatteryMonitor,
     pub(crate) processes: Vec<ProcessRow>,
     pub(crate) table_state: TableState,
     pub(crate) sort: SortBy,
@@ -59,6 +71,10 @@ impl App {
             os_name: System::long_os_version().unwrap_or_else(|| "unknown OS".into()),
             cpu_name,
             gpu: Gpu::detect(),
+            cpu_temp: None,
+            cpu_temp_history: TemperatureHistory::new(TEMPERATURE_HISTORY),
+            gpu_temp_history: TemperatureHistory::new(TEMPERATURE_HISTORY),
+            battery: BatteryMonitor::new(),
             processes: Vec::new(),
             table_state: TableState::default(),
             sort: SortBy::Cpu,
@@ -148,6 +164,15 @@ impl App {
             gpu.refresh();
         }
 
+        self.cpu_temp = cpu_temperature(&self.components);
+        if let Some(temp) = self.cpu_temp {
+            self.cpu_temp_history.push(temp);
+        }
+        if let Some(temp) = self.gpu.as_ref().and_then(|gpu| gpu.temperature) {
+            self.gpu_temp_history.push(temp);
+        }
+        self.battery.refresh();
+
         self.update_process_list();
         self.update_network();
     }
@@ -235,7 +260,7 @@ impl App {
 
         if panels_height > 0 {
             if grid {
-                let [device_rows, network_row] =
+                let [device_rows, bottom_row] =
                     Layout::vertical([Constraint::Length(18), Constraint::Length(6)]).areas(panels);
 
                 let [cpu_row, device_row] =
@@ -249,9 +274,23 @@ impl App {
                 self.render_memory(frame, memory);
                 self.render_gpu(frame, gpu);
                 self.render_disks(frame, disks);
-                self.render_network(frame, network_row);
+
+                if self.battery.present() {
+                    let [network, battery] = Layout::horizontal([
+                        Constraint::Fill(1),
+                        Constraint::Length(BATTERY_WIDTH),
+                    ])
+                    .areas(bottom_row);
+                    self.render_network(frame, network);
+                    self.render_battery(frame, battery);
+                } else {
+                    self.render_network(frame, bottom_row);
+                }
             } else {
-                let kinds = compact_panels(area.width);
+                let kinds: Vec<PanelKind> = compact_panels(area.width)
+                    .into_iter()
+                    .filter(|kind| *kind != PanelKind::Battery || self.battery.present())
+                    .collect();
                 let constraints = vec![Constraint::Ratio(1, kinds.len() as u32); kinds.len()];
                 let chunks = Layout::horizontal(constraints).split(panels);
 
@@ -273,6 +312,7 @@ impl App {
             PanelKind::Gpu => self.render_gpu(frame, area),
             PanelKind::Disks => self.render_disks(frame, area),
             PanelKind::Network => self.render_network(frame, area),
+            PanelKind::Battery => self.render_battery(frame, area),
         }
     }
 }

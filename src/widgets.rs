@@ -21,6 +21,11 @@ pub(crate) fn panel(title: &str) -> Block<'static> {
 
 /// Smooth horizontal bar using full, partial and empty blocks.
 pub(crate) fn bar_spans(usage: f32, width: usize) -> Vec<Span<'static>> {
+    bar_spans_colored(usage, width, usage_color(usage))
+}
+
+/// Smooth horizontal bar with an explicit fill color.
+pub(crate) fn bar_spans_colored(usage: f32, width: usize, color: Color) -> Vec<Span<'static>> {
     const PARTIALS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 
     let usage = usage.clamp(0.0, 100.0);
@@ -32,15 +37,12 @@ pub(crate) fn bar_spans(usage: f32, width: usize) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(3);
 
     if full > 0 {
-        spans.push(Span::styled(
-            "█".repeat(full),
-            Style::default().fg(usage_color(usage)),
-        ));
+        spans.push(Span::styled("█".repeat(full), Style::default().fg(color)));
     }
     if remainder > 0 {
         spans.push(Span::styled(
             PARTIALS[remainder - 1].to_string(),
-            Style::default().fg(usage_color(usage)),
+            Style::default().fg(color),
         ));
     }
     if empty > 0 {
@@ -55,6 +57,17 @@ pub(crate) fn bar_spans(usage: f32, width: usize) -> Vec<Span<'static>> {
 
 /// A labelled percentage bar, dropping the detail text when space runs out.
 pub(crate) fn meter(label: &str, usage: f32, detail: &str, width: u16) -> Line<'static> {
+    meter_colored(label, usage, detail, width, usage_color(usage))
+}
+
+/// A labelled percentage bar with an explicit fill color.
+pub(crate) fn meter_colored(
+    label: &str,
+    usage: f32,
+    detail: &str,
+    width: u16,
+    color: Color,
+) -> Line<'static> {
     const MIN_BAR: usize = 6;
 
     let label = format!("{label:<6}");
@@ -76,11 +89,8 @@ pub(crate) fn meter(label: &str, usage: f32, detail: &str, width: u16) -> Line<'
     let bar_width = width.saturating_sub(fixed + detail.chars().count()).max(1);
 
     let mut spans = vec![Span::styled(label, Style::default().fg(MUTED).bold())];
-    spans.extend(bar_spans(usage, bar_width));
-    spans.push(Span::styled(
-        percent,
-        Style::default().fg(usage_color(usage)).bold(),
-    ));
+    spans.extend(bar_spans_colored(usage, bar_width, color));
+    spans.push(Span::styled(percent, Style::default().fg(color).bold()));
     if !detail.is_empty() {
         spans.push(Span::styled(detail, Style::default().fg(MUTED)));
     }

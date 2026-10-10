@@ -2,17 +2,17 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, LineGauge, Paragraph, Row, Sparkline, Table};
 use sysinfo::System;
 
 use crate::app::App;
+use crate::battery::{BatteryInfo, format_duration};
 use crate::disks::disk_rows;
 use crate::format::{format_memory, format_rate, format_rate_short, percent, to_gib};
 use crate::network::NetworkRow;
 use crate::processes::{ProcessColumn, SortBy, header_cell, process_columns};
-use crate::sensors::cpu_temperature;
-use crate::theme::{ACCENT, MUTED, UPLOAD, usage_color};
-use crate::widgets::{bar_spans, meter, panel, right, truncate};
+use crate::theme::{ACCENT, MUTED, UPLOAD, charge_color, temperature_color, usage_color};
+use crate::widgets::{bar_spans, meter, meter_colored, panel, right, truncate};
 
 impl App {
     pub(crate) fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -100,11 +100,7 @@ impl App {
 
     pub(crate) fn render_cpu(&self, frame: &mut Frame, area: Rect) {
         let average = self.system.global_cpu_usage();
-        let title = match cpu_temperature(&self.components) {
-            Some(temperature) => format!("CPU {average:.0}% · {temperature:.0}°C"),
-            None => format!("CPU {average:.0}%"),
-        };
-        let block = panel(&title);
+        let block = panel(&format!("CPU {average:.0}%"));
         let inner = block.inner(area);
 
         frame.render_widget(block, area);
@@ -113,12 +109,14 @@ impl App {
             return;
         }
 
+        let [body, temperature] = split_temperature(inner, self.cpu_temp.is_some());
+
         let name = Line::from(Span::styled(
             self.cpu_name.as_str(),
             Style::default().fg(Color::White),
         ));
-        let per_line = (inner.width as usize / 17).clamp(1, 4);
-        let max_lines = inner.height as usize;
+        let per_line = (body.width as usize / 17).clamp(1, 4);
+        let max_lines = body.height as usize;
 
         let mut lines = vec![name];
 
@@ -152,7 +150,14 @@ impl App {
             lines.push(Line::from(spans));
         }
 
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(Paragraph::new(lines), body);
+
+        render_temperature_graph(
+            frame,
+            temperature,
+            self.cpu_temp,
+            &self.cpu_temp_history.tail(temperature.width as usize),
+        );
     }
 
     pub(crate) fn render_memory(&self, frame: &mut Frame, area: Rect) {
@@ -191,29 +196,29 @@ impl App {
 
     pub(crate) fn render_gpu(&self, frame: &mut Frame, area: Rect) {
         let block = match &self.gpu {
-            Some(gpu) => {
-                let title = match gpu.temperature {
-                    Some(temperature) => {
-                        format!("GPU {:.0}% · {temperature:.0}°C", gpu.usage)
-                    }
-                    None => format!("GPU {:.0}%", gpu.usage),
-                };
-                panel(&title)
-            }
+            Some(gpu) => panel(&format!("GPU {:.0}%", gpu.usage)),
             None => panel("GPU"),
         };
         let inner = block.inner(area);
 
         frame.render_widget(block, area);
 
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
         let Some(gpu) = &self.gpu else {
-            let message = Paragraph::new(Line::from(Span::styled(
-                "No GPU detected",
-                Style::default().fg(MUTED),
-            )));
-            frame.render_widget(message, inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "No GPU detected",
+                    Style::default().fg(MUTED),
+                ))),
+                inner,
+            );
             return;
         };
+
+        let [body, temperature] = split_temperature(inner, gpu.temperature.is_some());
 
         let lines = vec![
             Line::from(Span::styled(
@@ -221,10 +226,17 @@ impl App {
                 Style::default().fg(Color::White),
             )),
             Line::from(""),
-            meter("GPU", gpu.usage, "", inner.width),
+            meter("GPU", gpu.usage, "", body.width),
         ];
 
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(Paragraph::new(lines), body);
+
+        render_temperature_graph(
+            frame,
+            temperature,
+            gpu.temperature,
+            &self.gpu_temp_history.tail(temperature.width as usize),
+        );
     }
 
     pub(crate) fn render_disks(&self, frame: &mut Frame, area: Rect) {
@@ -308,6 +320,37 @@ impl App {
             .network_rows
             .iter()
             .map(|row| network_line(row, name_width, compact))
+            .collect::<Vec<_>>();
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    pub(crate) fn render_battery(&self, frame: &mut Frame, area: Rect) {
+        let block = panel("Battery");
+        let inner = block.inner(area);
+
+        frame.render_widget(block, area);
+
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        let batteries = self.battery.batteries();
+
+        if batteries.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "No battery detected",
+                    Style::default().fg(MUTED),
+                ))),
+                inner,
+            );
+            return;
+        }
+
+        let lines = batteries
+            .iter()
+            .flat_map(|battery| battery_lines(battery, inner.width))
             .collect::<Vec<_>>();
 
         frame.render_widget(Paragraph::new(lines), inner);
@@ -412,4 +455,78 @@ fn network_line(row: &NetworkRow, name_width: usize, compact: bool) -> Line<'sta
             Span::styled(format!("↑ {}", format_rate(row.transmitted)), up),
         ])
     }
+}
+
+/// Splits a panel into a body area and a temperature band
+/// (empty when there is no sensor or no room).
+fn split_temperature(inner: Rect, has_temperature: bool) -> [Rect; 2] {
+    let graph_height = if has_temperature && inner.height >= 2 {
+        inner.height.saturating_sub(1).min(4)
+    } else {
+        0
+    };
+
+    Layout::vertical([Constraint::Min(0), Constraint::Length(graph_height)]).areas(inner)
+}
+
+/// Draws a temperature line gauge above a sparkline of recent readings.
+fn render_temperature_graph(frame: &mut Frame, area: Rect, current: Option<f32>, history: &[u64]) {
+    let Some(current) = current else {
+        return;
+    };
+
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let color = temperature_color(current);
+    let [gauge_area, graph_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+
+    frame.render_widget(
+        LineGauge::default()
+            .ratio((f64::from(current) / 100.0).clamp(0.0, 1.0))
+            .label(format!("{current:.0}°C"))
+            .filled_style(Style::default().fg(color))
+            .unfilled_style(Style::default().fg(MUTED)),
+        gauge_area,
+    );
+
+    if graph_area.height > 0 && !history.is_empty() {
+        frame.render_widget(
+            Sparkline::default()
+                .data(history)
+                .max(100)
+                .style(Style::default().fg(color)),
+            graph_area,
+        );
+    }
+}
+
+/// Builds the charge meter and details for a single battery.
+fn battery_lines(battery: &BatteryInfo, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![meter_colored(
+        "Batt",
+        battery.percentage,
+        battery.state.label(),
+        width,
+        charge_color(battery.percentage),
+    )];
+
+    let mut details = Vec::new();
+    if let Some(remaining) = battery.remaining() {
+        details.push(format_duration(remaining));
+    }
+    if let Some(temperature) = battery.temperature {
+        details.push(format!("{temperature:.0}°C"));
+    }
+
+    if !details.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", details.join(" · ")),
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    lines
 }

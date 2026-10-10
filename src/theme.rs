@@ -16,6 +16,28 @@ pub(crate) fn usage_color(usage: f32) -> Color {
     }
 }
 
+/// Maps a temperature (in degrees Celsius) to a cool/warm/hot color.
+pub(crate) fn temperature_color(celsius: f32) -> Color {
+    if celsius >= 80.0 {
+        Color::Red
+    } else if celsius >= 60.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+/// Maps a battery charge percentage to a color (a low charge is a warning).
+pub(crate) fn charge_color(percentage: f32) -> Color {
+    if percentage <= 15.0 {
+        Color::Red
+    } else if percentage <= 40.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -27,5 +49,22 @@ mod tests {
         assert_eq!(usage_color(70.0), Color::Yellow);
         assert_eq!(usage_color(89.9), Color::Yellow);
         assert_eq!(usage_color(90.0), Color::Red);
+    }
+
+    #[test]
+    fn temperature_color_thresholds() {
+        assert_eq!(temperature_color(35.0), Color::Green);
+        assert_eq!(temperature_color(59.9), Color::Green);
+        assert_eq!(temperature_color(60.0), Color::Yellow);
+        assert_eq!(temperature_color(79.9), Color::Yellow);
+        assert_eq!(temperature_color(80.0), Color::Red);
+    }
+
+    #[test]
+    fn charge_color_inverts_usage_semantics() {
+        assert_eq!(charge_color(5.0), Color::Red);
+        assert_eq!(charge_color(15.0), Color::Red);
+        assert_eq!(charge_color(40.0), Color::Yellow);
+        assert_eq!(charge_color(80.0), Color::Green);
     }
 }
