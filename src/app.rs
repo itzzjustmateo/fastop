@@ -18,8 +18,6 @@ use crate::temperature::TemperatureHistory;
 
 /// Number of temperature samples kept for the CPU/GPU sparkline graphs.
 const TEMPERATURE_HISTORY: usize = 120;
-/// Width reserved for the battery panel in the grid layout.
-const BATTERY_WIDTH: u16 = 32;
 
 /// All application state and the event loop.
 pub(crate) struct App {
@@ -260,11 +258,12 @@ impl App {
 
         if panels_height > 0 {
             if grid {
-                let [device_rows, bottom_row] =
-                    Layout::vertical([Constraint::Length(18), Constraint::Length(6)]).areas(panels);
-
-                let [cpu_row, device_row] =
-                    Layout::vertical([Constraint::Ratio(1, 2); 2]).areas(device_rows);
+                let [cpu_row, device_row, network_row] = Layout::vertical([
+                    Constraint::Length(9),
+                    Constraint::Length(7),
+                    Constraint::Length(6),
+                ])
+                .areas(panels);
 
                 let [cpu, memory] = Layout::horizontal([Constraint::Ratio(1, 2); 2]).areas(cpu_row);
                 let [gpu, disks] =
@@ -274,23 +273,9 @@ impl App {
                 self.render_memory(frame, memory);
                 self.render_gpu(frame, gpu);
                 self.render_disks(frame, disks);
-
-                if self.battery.present() {
-                    let [network, battery] = Layout::horizontal([
-                        Constraint::Fill(1),
-                        Constraint::Length(BATTERY_WIDTH),
-                    ])
-                    .areas(bottom_row);
-                    self.render_network(frame, network);
-                    self.render_battery(frame, battery);
-                } else {
-                    self.render_network(frame, bottom_row);
-                }
+                self.render_network(frame, network_row);
             } else {
-                let kinds: Vec<PanelKind> = compact_panels(area.width)
-                    .into_iter()
-                    .filter(|kind| *kind != PanelKind::Battery || self.battery.present())
-                    .collect();
+                let kinds = compact_panels(area.width);
                 let constraints = vec![Constraint::Ratio(1, kinds.len() as u32); kinds.len()];
                 let chunks = Layout::horizontal(constraints).split(panels);
 
@@ -312,7 +297,6 @@ impl App {
             PanelKind::Gpu => self.render_gpu(frame, area),
             PanelKind::Disks => self.render_disks(frame, area),
             PanelKind::Network => self.render_network(frame, area),
-            PanelKind::Battery => self.render_battery(frame, area),
         }
     }
 }

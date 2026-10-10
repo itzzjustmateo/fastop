@@ -6,13 +6,13 @@ use ratatui::widgets::{Cell, LineGauge, Paragraph, Row, Sparkline, Table};
 use sysinfo::System;
 
 use crate::app::App;
-use crate::battery::{BatteryInfo, format_duration};
+use crate::battery::{BatteryInfo, BatteryState, format_duration};
 use crate::disks::disk_rows;
 use crate::format::{format_memory, format_rate, format_rate_short, percent, to_gib};
 use crate::network::NetworkRow;
 use crate::processes::{ProcessColumn, SortBy, header_cell, process_columns};
 use crate::theme::{ACCENT, MUTED, UPLOAD, charge_color, temperature_color, usage_color};
-use crate::widgets::{bar_spans, meter, meter_colored, panel, right, truncate};
+use crate::widgets::{bar_spans, bar_spans_colored, meter, panel, right, truncate};
 
 impl App {
     pub(crate) fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -33,12 +33,32 @@ impl App {
             area
         };
 
-        let [brand, system, uptime] = Layout::horizontal([
-            Constraint::Length(9),
-            Constraint::Min(1),
-            Constraint::Length(13),
-        ])
-        .areas(inner);
+        const BRAND_WIDTH: u16 = 9;
+        const BATTERY_WIDTH: u16 = 30;
+        const UPTIME_WIDTH: u16 = 13;
+
+        let batteries = self.battery.batteries();
+        let show_battery = self.battery.present() && inner.width >= 80;
+
+        let constraints = if show_battery {
+            vec![
+                Constraint::Length(BRAND_WIDTH),
+                Constraint::Min(1),
+                Constraint::Length(BATTERY_WIDTH),
+                Constraint::Length(UPTIME_WIDTH),
+            ]
+        } else {
+            vec![
+                Constraint::Length(BRAND_WIDTH),
+                Constraint::Min(1),
+                Constraint::Length(UPTIME_WIDTH),
+            ]
+        };
+
+        let chunks = Layout::horizontal(constraints).split(inner);
+        let brand = chunks[0];
+        let system = chunks[1];
+        let uptime = chunks[chunks.len() - 1];
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -59,6 +79,10 @@ impl App {
             ])),
             system,
         );
+
+        if show_battery {
+            frame.render_widget(Paragraph::new(battery_line(&batteries[0])), chunks[2]);
+        }
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -225,7 +249,6 @@ impl App {
                 gpu.name.as_str(),
                 Style::default().fg(Color::White),
             )),
-            Line::from(""),
             meter("GPU", gpu.usage, "", body.width),
         ];
 
@@ -320,37 +343,6 @@ impl App {
             .network_rows
             .iter()
             .map(|row| network_line(row, name_width, compact))
-            .collect::<Vec<_>>();
-
-        frame.render_widget(Paragraph::new(lines), inner);
-    }
-
-    pub(crate) fn render_battery(&self, frame: &mut Frame, area: Rect) {
-        let block = panel("Battery");
-        let inner = block.inner(area);
-
-        frame.render_widget(block, area);
-
-        if inner.height == 0 || inner.width == 0 {
-            return;
-        }
-
-        let batteries = self.battery.batteries();
-
-        if batteries.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "No battery detected",
-                    Style::default().fg(MUTED),
-                ))),
-                inner,
-            );
-            return;
-        }
-
-        let lines = batteries
-            .iter()
-            .flat_map(|battery| battery_lines(battery, inner.width))
             .collect::<Vec<_>>();
 
         frame.render_widget(Paragraph::new(lines), inner);
@@ -461,7 +453,7 @@ fn network_line(row: &NetworkRow, name_width: usize, compact: bool) -> Line<'sta
 /// (empty when there is no sensor or no room).
 fn split_temperature(inner: Rect, has_temperature: bool) -> [Rect; 2] {
     let graph_height = if has_temperature && inner.height >= 2 {
-        inner.height.saturating_sub(1).min(4)
+        inner.height.saturating_sub(1).min(3)
     } else {
         0
     };
@@ -503,30 +495,30 @@ fn render_temperature_graph(frame: &mut Frame, area: Rect, current: Option<f32>,
     }
 }
 
-/// Builds the charge meter and details for a single battery.
-fn battery_lines(battery: &BatteryInfo, width: u16) -> Vec<Line<'static>> {
-    let mut lines = vec![meter_colored(
-        "Batt",
-        battery.percentage,
-        battery.state.label(),
-        width,
-        charge_color(battery.percentage),
-    )];
+/// Builds the compact battery indicator shown in the header bar.
+fn battery_line(battery: &BatteryInfo) -> Line<'static> {
+    let color = charge_color(battery.percentage);
 
-    let mut details = Vec::new();
-    if let Some(remaining) = battery.remaining() {
-        details.push(format_duration(remaining));
-    }
-    if let Some(temperature) = battery.temperature {
-        details.push(format!("{temperature:.0}°C"));
+    let mut spans = vec![Span::styled("BATT ", Style::default().fg(MUTED).bold())];
+    spans.extend(bar_spans_colored(battery.percentage, 6, color));
+    spans.push(Span::styled(
+        format!(" {:>3.0}%", battery.percentage),
+        Style::default().fg(color).bold(),
+    ));
+
+    let detail = battery
+        .remaining()
+        .map(format_duration)
+        .or_else(|| battery.temperature.map(|celsius| format!("{celsius:.0}°C")))
+        .unwrap_or_else(|| battery.state.label().to_string());
+    spans.push(Span::styled(
+        format!(" {detail}"),
+        Style::default().fg(MUTED),
+    ));
+
+    if battery.state == BatteryState::Charging {
+        spans.push(Span::styled(" +", Style::default().fg(Color::LightGreen)));
     }
 
-    if !details.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", details.join(" · ")),
-            Style::default().fg(MUTED),
-        )));
-    }
-
-    lines
+    Line::from(spans)
 }

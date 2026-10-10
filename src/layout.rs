@@ -2,8 +2,8 @@ use ratatui::layout::Rect;
 
 use crate::cli::LayoutMode;
 
-/// Height of the full panel grid (2x2 summary plus a network row).
-const GRID_HEIGHT: u16 = 24;
+/// Height of the full panel grid (two summary rows plus a network row).
+const GRID_HEIGHT: u16 = 22;
 /// Height of the single compact row of panels.
 const COMPACT_HEIGHT: u16 = 9;
 
@@ -15,7 +15,6 @@ pub(crate) enum PanelKind {
     Gpu,
     Disks,
     Network,
-    Battery,
 }
 
 /// Height reserved for the header (0, 1 or 3 lines).
@@ -50,9 +49,7 @@ pub(crate) fn panels_layout(area: Rect, mode: LayoutMode) -> (bool, u16) {
 pub(crate) fn compact_panels(width: u16) -> Vec<PanelKind> {
     use PanelKind::*;
 
-    if width >= 132 {
-        vec![Cpu, Memory, Gpu, Disks, Network, Battery]
-    } else if width >= 108 {
+    if width >= 108 {
         vec![Cpu, Memory, Gpu, Disks, Network]
     } else if width >= 88 {
         vec![Cpu, Memory, Gpu, Network]
@@ -71,7 +68,7 @@ mod tests {
 
     #[test]
     fn compact_panels_adapt_to_width() {
-        assert_eq!(compact_panels(140).len(), 6);
+        assert_eq!(compact_panels(140).len(), 5);
         assert_eq!(compact_panels(120).len(), 5);
         assert_eq!(compact_panels(100).len(), 4);
         assert_eq!(compact_panels(80).len(), 3);
@@ -83,7 +80,7 @@ mod tests {
     fn panels_layout_scales_with_terminal() {
         let rect = |w, h| Rect::new(0, 0, w, h);
 
-        assert_eq!(panels_layout(rect(120, 40), LayoutMode::Auto), (true, 24));
+        assert_eq!(panels_layout(rect(120, 40), LayoutMode::Auto), (true, 22));
         assert_eq!(
             panels_layout(Rect::new(0, 0, 120, 30), LayoutMode::Auto),
             (false, 9)
@@ -110,7 +107,7 @@ mod tests {
     fn grid_mode_fits_smaller_terminals() {
         assert_eq!(
             panels_layout(Rect::new(0, 0, 120, 30), LayoutMode::Grid),
-            (true, 24)
+            (true, 22)
         );
         assert_eq!(
             panels_layout(Rect::new(0, 0, 120, 24), LayoutMode::Grid),

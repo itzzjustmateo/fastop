@@ -9,9 +9,9 @@ A *fast, lightweight* alternative to [btop](https://github.com/aristocratos/btop
 - GPU usage plus a temperature gauge and history graph (sysfs, with an `nvidia-smi` fallback)
 - Disk usage per physical device
 - Network throughput per interface (download/upload rates)
-- Battery charge, state and time remaining (shown when a battery is present)
+- Battery charge and time remaining as a header indicator (shown when a battery is present)
 - Process table with selection and sortable columns (`s` cycles CPU → MEM → PID → NAME)
-- Responsive layout: full 2×2 grid on large terminals, a single compact row on smaller ones
+- Responsive layout: a 2×2 summary grid with a full-width Network row on large terminals, a single compact row on smaller ones
 
 ## Usage
 
