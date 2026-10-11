@@ -87,6 +87,14 @@ impl BatteryMonitor {
         }
     }
 
+    /// Builds a monitor that never samples (used when batteries are disabled).
+    pub(crate) fn disabled() -> Self {
+        Self {
+            manager: None,
+            batteries: Vec::new(),
+        }
+    }
+
     /// Refreshes the cached snapshots from the backend.
     pub(crate) fn refresh(&mut self) {
         let Some(manager) = &self.manager else {

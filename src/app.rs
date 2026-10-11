@@ -1,43 +1,21 @@
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::widgets::TableState;
 use ratatui::{DefaultTerminal, Frame};
 use std::time::{Duration, Instant};
-use sysinfo::{
-    Components, Disks, MINIMUM_CPU_UPDATE_INTERVAL, Networks, ProcessesToUpdate, System, Users,
-};
 
-use crate::battery::BatteryMonitor;
 use crate::cli::LayoutMode;
-use crate::gpu::Gpu;
-use crate::layout::{PanelKind, compact_panels, header_height, panels_layout};
-use crate::network::{NetworkRow, is_network_interface};
-use crate::processes::{ProcessRow, SortBy, compare_processes};
-use crate::sensors::cpu_temperature;
-use crate::temperature::TemperatureHistory;
+use crate::collect::{CollectOptions, Collector};
+use crate::layout::{compact_panels, header_height, panels_layout};
+use crate::processes::SortBy;
 
-/// Number of temperature samples kept for the CPU/GPU sparkline graphs.
-const TEMPERATURE_HISTORY: usize = 120;
-
-/// All application state and the event loop.
+/// Application state: a [`Collector`] plus the UI state and the event loop.
+///
+/// The collector owns every data source; the panels read from it through
+/// accessors, so adding a panel never touches the collection logic.
 pub(crate) struct App {
     pub(crate) running: bool,
-    pub(crate) system: System,
-    pub(crate) components: Components,
-    pub(crate) disks: Disks,
-    pub(crate) networks: Networks,
-    pub(crate) network_rows: Vec<NetworkRow>,
-    pub(crate) network_tick: Instant,
-    pub(crate) users: Users,
-    pub(crate) host_name: String,
-    pub(crate) os_name: String,
-    pub(crate) cpu_name: String,
-    pub(crate) gpu: Option<Gpu>,
-    pub(crate) cpu_temp: Option<f32>,
-    pub(crate) cpu_temp_history: TemperatureHistory,
-    pub(crate) gpu_temp_history: TemperatureHistory,
-    pub(crate) battery: BatteryMonitor,
-    pub(crate) processes: Vec<ProcessRow>,
+    pub(crate) collector: Collector,
     pub(crate) table_state: TableState,
     pub(crate) sort: SortBy,
     pub(crate) tick: Duration,
@@ -45,42 +23,23 @@ pub(crate) struct App {
 }
 
 impl App {
-    /// Builds the app from the resolved settings and takes a first sample.
-    pub(crate) fn new(tick: Duration, layout: LayoutMode) -> Self {
-        let mut system = System::new_all();
-        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
-        system.refresh_cpu_usage();
-
-        let cpu_name = system
-            .cpus()
-            .first()
-            .map_or_else(|| "Unknown CPU".to_string(), |cpu| cpu.brand().to_string());
-
+    /// Builds the app from resolved settings and takes a first sample.
+    pub(crate) fn new(
+        tick: Duration,
+        layout: LayoutMode,
+        sort: SortBy,
+        options: CollectOptions,
+    ) -> Self {
         let mut app = Self {
             running: true,
-            system,
-            components: Components::new_with_refreshed_list(),
-            disks: Disks::new_with_refreshed_list(),
-            networks: Networks::new_with_refreshed_list(),
-            network_rows: Vec::new(),
-            network_tick: Instant::now(),
-            users: Users::new_with_refreshed_list(),
-            host_name: System::host_name().unwrap_or_else(|| "unknown".into()),
-            os_name: System::long_os_version().unwrap_or_else(|| "unknown OS".into()),
-            cpu_name,
-            gpu: Gpu::detect(),
-            cpu_temp: None,
-            cpu_temp_history: TemperatureHistory::new(TEMPERATURE_HISTORY),
-            gpu_temp_history: TemperatureHistory::new(TEMPERATURE_HISTORY),
-            battery: BatteryMonitor::new(),
-            processes: Vec::new(),
+            collector: Collector::new(options),
             table_state: TableState::default(),
-            sort: SortBy::Cpu,
+            sort,
             tick,
             layout,
         };
-
-        app.on_tick();
+        app.collector.resort(sort);
+        app.clamp_process_selection();
         app
     }
 
@@ -121,124 +80,51 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
             KeyCode::Char('s') => {
                 self.sort = self.sort.next();
-                self.update_process_list();
+                self.collector.resort(self.sort);
             }
             _ => {}
         }
     }
 
     fn select_next(&mut self) {
+        let count = self.collector.process_rows().len();
         let next = match self.table_state.selected() {
-            Some(index) if index + 1 < self.processes.len() => index + 1,
+            Some(index) if index + 1 < count => index + 1,
             _ => 0,
         };
 
-        if !self.processes.is_empty() {
+        if count > 0 {
             self.table_state.select(Some(next));
         }
     }
 
     fn select_previous(&mut self) {
+        let count = self.collector.process_rows().len();
         let previous = match self.table_state.selected() {
-            Some(0) | None => self.processes.len().saturating_sub(1),
+            Some(0) | None => count.saturating_sub(1),
             Some(index) => index - 1,
         };
 
-        if !self.processes.is_empty() {
+        if count > 0 {
             self.table_state.select(Some(previous));
         }
     }
 
     fn on_tick(&mut self) {
-        self.system.refresh_cpu_usage();
-        self.system.refresh_memory();
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
-        self.components.refresh(false);
-        self.disks.refresh(true);
-        self.networks.refresh(true);
-        self.users.refresh();
-
-        if let Some(gpu) = &mut self.gpu {
-            gpu.refresh();
-        }
-
-        self.cpu_temp = cpu_temperature(&self.components);
-        if let Some(temp) = self.cpu_temp {
-            self.cpu_temp_history.push(temp);
-        }
-        if let Some(temp) = self.gpu.as_ref().and_then(|gpu| gpu.temperature) {
-            self.gpu_temp_history.push(temp);
-        }
-        self.battery.refresh();
-
-        self.update_process_list();
-        self.update_network();
+        self.collector.refresh(self.sort);
+        self.clamp_process_selection();
     }
 
-    fn update_network(&mut self) {
-        let now = Instant::now();
-        let elapsed = now
-            .duration_since(self.network_tick)
-            .as_secs_f64()
-            .max(0.05);
-        self.network_tick = now;
-
-        let mut rows: Vec<NetworkRow> = self
-            .networks
-            .list()
-            .iter()
-            .filter(|(name, _)| is_network_interface(name))
-            .map(|(name, data)| NetworkRow {
-                name: name.clone(),
-                received: data.received() as f64 / elapsed,
-                transmitted: data.transmitted() as f64 / elapsed,
-            })
-            .collect();
-
-        rows.sort_by(|a, b| {
-            (b.received + b.transmitted)
-                .total_cmp(&(a.received + a.transmitted))
-                .then_with(|| a.name.cmp(&b.name))
-        });
-
-        self.network_rows = rows;
-    }
-
-    fn update_process_list(&mut self) {
-        let users = &self.users;
-
-        let mut processes: Vec<ProcessRow> = self
-            .system
-            .processes()
-            .iter()
-            .map(|(pid, process)| {
-                let user = process
-                    .user_id()
-                    .and_then(|uid| users.get_user_by_id(uid))
-                    .map_or_else(|| "?".to_string(), |user| user.name().to_string());
-
-                ProcessRow {
-                    pid: pid.as_u32(),
-                    user,
-                    name: process.name().to_string_lossy().into_owned(),
-                    cpu: process.cpu_usage(),
-                    memory: process.memory(),
-                }
-            })
-            .collect();
-
-        processes.sort_by(|a, b| compare_processes(self.sort, a, b));
-
-        self.processes = processes;
-
+    /// Keeps the table selection within the new process row count.
+    fn clamp_process_selection(&mut self) {
+        let count = self.collector.process_rows().len();
         let selected = self
             .table_state
             .selected()
             .unwrap_or(0)
-            .min(self.processes.len().saturating_sub(1));
+            .min(count.saturating_sub(1));
 
-        self.table_state
-            .select((!self.processes.is_empty()).then_some(selected));
+        self.table_state.select((count != 0).then_some(selected));
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -289,16 +175,6 @@ impl App {
         self.render_processes(frame, processes);
         self.render_footer(frame, footer);
     }
-
-    fn render_panel(&self, frame: &mut Frame, kind: PanelKind, area: Rect) {
-        match kind {
-            PanelKind::Cpu => self.render_cpu(frame, area),
-            PanelKind::Memory => self.render_memory(frame, area),
-            PanelKind::Gpu => self.render_gpu(frame, area),
-            PanelKind::Disks => self.render_disks(frame, area),
-            PanelKind::Network => self.render_network(frame, area),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -306,11 +182,21 @@ mod tests {
     use super::*;
 
     fn test_app() -> App {
-        App::new(Duration::from_millis(500), LayoutMode::Auto)
+        App::new(
+            Duration::from_millis(500),
+            LayoutMode::Auto,
+            SortBy::Cpu,
+            CollectOptions::default(),
+        )
     }
 
     fn grid_app() -> App {
-        App::new(Duration::from_millis(500), LayoutMode::Grid)
+        App::new(
+            Duration::from_millis(500),
+            LayoutMode::Grid,
+            SortBy::Cpu,
+            CollectOptions::default(),
+        )
     }
 
     #[test]
@@ -361,6 +247,18 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| app.render(frame)).unwrap();
             assert_eq!(terminal.backend().buffer().area.width, width);
+        }
+    }
+
+    #[test]
+    fn clamps_selection_to_the_process_count() {
+        let mut app = test_app();
+        app.table_state.select(Some(usize::MAX));
+
+        app.clamp_process_selection();
+
+        if let Some(selected) = app.table_state.selected() {
+            assert!(selected < app.collector.process_rows().len());
         }
     }
 }

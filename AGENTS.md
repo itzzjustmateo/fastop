@@ -56,16 +56,18 @@ errors in CI, so an unused import or field will fail the build.
 | Module | Responsibility |
 | --- | --- |
 | `main.rs` | Entry point: parse CLI options, load config, start the app |
-| `cli.rs` | `clap` definitions (`Cli`, `LayoutMode`, tick bounds) |
-| `config.rs` | Cross-platform `config.toml` loading and saving |
-| `app.rs` | Application state, event loop, top-level frame layout |
-| `panels.rs` | `impl App` renderers for the header, footer and every panel |
+| `cli.rs` | `clap` definitions (`Cli`, `LayoutMode`, tick bounds, duration parsing) |
+| `config.rs` | Cross-platform `config.toml` loading and saving (`Config`, `Overrides`) |
+| `collect.rs` | Data collection: `Collector` owns the sysinfo/GPU/battery handles and produces the display rows |
+| `app.rs` | Application state (collector + UI state), event loop, top-level frame layout |
+| `ui/mod.rs` | Panel dispatch (`render_panel`) and shared rendering helpers |
+| `ui/*.rs` | `impl App` renderers, one module per panel (header, footer, CPU, memory, GPU, disks, network, processes) |
 | `layout.rs` | Panel selection and responsive layout decisions |
 | `theme.rs` | Color constants and threshold-based colors |
 | `widgets.rs` | Reusable UI primitives (panels, meters, bars) |
 | `format.rs` | Byte / rate / percentage formatting helpers |
 | `processes.rs` | Process rows, columns and sorting |
-| `disks.rs` | Disk enumeration and filtering |
+| `disks.rs` | Disk enumeration: physical drives (Linux `/sys/block`) + mount usage |
 | `network.rs` | Network interface filtering and rows |
 | `gpu.rs` | GPU detection and sampling (sysfs / `nvidia-smi`) |
 | `battery.rs` | Battery detection and snapshots |
@@ -75,15 +77,17 @@ errors in CI, so an unused import or field will fail the build.
 **Data flow**
 
 1. `main.rs` parses the CLI, loads/merges config, then runs `App`.
-2. `App::on_tick` refreshes `sysinfo` handles (system, components, disks,
-   networks, users), the GPU backend and the battery snapshot, then rebuilds the
-   process and network rows.
-3. `App::render` lays out the frame — header, panels band, process table, footer
-   — and delegates to the `render_*` methods.
+2. `App::new` builds a `Collector`, which samples every source once.
+3. `App::on_tick` calls `Collector::refresh`, which refreshes the `sysinfo`
+   handles, the GPU backend and the battery snapshot, then rebuilds the
+   process, network and disk rows.
+4. `App::render` lays out the frame — header, panels band, process table, footer
+   — and delegates to the `render_*` methods in `ui/`.
 
-Keep new data collection in its own small module, and new UI in `panels.rs`
-(rendering lives there as `impl App` over `pub(crate)` fields). Rendering methods
-are pure: they only read state.
+Keep new data collection inside `collect.rs` (as a `Collector` method) and new
+UI in a dedicated `ui/` module (rendering lives there as `impl App` over
+`pub(crate)` fields). Rendering methods are pure: they only read state through
+the collector's accessors and never refresh it.
 
 ## Conventions
 
@@ -111,6 +115,10 @@ are pure: they only read state.
   `sensors.rs`.
 - **Battery**: provided by the `starship-battery` crate (pure sysfs / IOKit /
   Windows APIs, no system libraries).
+- **Disks**: enumerate physical drives from `/sys/block` on Linux so unmounted
+  drives are shown, then merge mount usage from `sysinfo`; other platforms list
+  mounted filesystems only. Count each backing device once (btrfs subvolumes
+  share a device).
 - **Config**: resolve paths with `directories::BaseDirs`; never hardcode home
   directories. Precedence is CLI → `config.toml` → built-in defaults. A missing
   or invalid config must never be fatal — report and fall back to defaults.

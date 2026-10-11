@@ -24,6 +24,7 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{DEFAULT_TICK_MS, LayoutMode, MAX_TICK_MS, MIN_TICK_MS};
+use crate::processes::SortBy;
 
 /// Application directory created inside the platform configuration directory.
 const APP_DIR: &str = "fastop";
@@ -42,6 +43,12 @@ pub(crate) struct Config {
     pub(crate) tick: u64,
     /// Preferred arrangement of the summary panels.
     pub(crate) layout: LayoutMode,
+    /// Initial sort column of the process table.
+    pub(crate) sort: SortBy,
+    /// Whether to detect and sample a GPU.
+    pub(crate) gpu: bool,
+    /// Whether to detect and sample the battery.
+    pub(crate) battery: bool,
 }
 
 impl Default for Config {
@@ -49,8 +56,29 @@ impl Default for Config {
         Self {
             tick: DEFAULT_TICK_MS,
             layout: LayoutMode::Auto,
+            sort: SortBy::Cpu,
+            gpu: true,
+            battery: true,
         }
     }
+}
+
+/// Command-line values that override the loaded configuration.
+///
+/// A field is [`None`] when the flag was not supplied, in which case the
+/// configuration file (and ultimately the default) wins.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Overrides {
+    /// Refresh interval in milliseconds.
+    pub(crate) tick: Option<u64>,
+    /// Preferred panel layout.
+    pub(crate) layout: Option<LayoutMode>,
+    /// Initial process sort column.
+    pub(crate) sort: Option<SortBy>,
+    /// Collect GPU metrics (set to `Some(false)` by `--no-gpu`).
+    pub(crate) gpu: Option<bool>,
+    /// Collect battery metrics (set to `Some(false)` by `--no-battery`).
+    pub(crate) battery: Option<bool>,
 }
 
 impl Config {
@@ -64,10 +92,16 @@ impl Config {
     /// Values supplied on the command line take precedence over the
     /// configuration file, which in turn takes precedence over the built-in
     /// defaults.
-    pub(crate) fn with_overrides(self, tick: Option<u64>, layout: Option<LayoutMode>) -> Self {
+    pub(crate) fn with_overrides(self, overrides: Overrides) -> Self {
         Self {
-            tick: tick.unwrap_or(self.tick).clamp(MIN_TICK_MS, MAX_TICK_MS),
-            layout: layout.unwrap_or(self.layout),
+            tick: overrides
+                .tick
+                .unwrap_or(self.tick)
+                .clamp(MIN_TICK_MS, MAX_TICK_MS),
+            layout: overrides.layout.unwrap_or(self.layout),
+            sort: overrides.sort.unwrap_or(self.sort),
+            gpu: overrides.gpu.unwrap_or(self.gpu),
+            battery: overrides.battery.unwrap_or(self.battery),
         }
     }
 
@@ -290,6 +324,7 @@ mod tests {
         let config = Config {
             tick: 750,
             layout: LayoutMode::Compact,
+            ..Config::default()
         };
 
         let written = config.save(Some(&path)).expect("save config");
@@ -308,6 +343,7 @@ mod tests {
         Config {
             tick: 1500,
             layout: LayoutMode::Grid,
+            ..Config::default()
         }
         .save(Some(&path))
         .expect("save config");
@@ -334,28 +370,64 @@ mod tests {
         let config = Config {
             tick: 250,
             layout: LayoutMode::Compact,
+            ..Config::default()
         };
 
-        let merged = config.clone().with_overrides(Some(1000), None);
+        let merged = config.clone().with_overrides(Overrides {
+            tick: Some(1000),
+            ..Overrides::default()
+        });
         assert_eq!(merged.tick, 1000);
         assert_eq!(merged.layout, LayoutMode::Compact);
 
-        let merged = Config::default().with_overrides(None, Some(LayoutMode::Grid));
+        let merged = Config::default().with_overrides(Overrides {
+            layout: Some(LayoutMode::Grid),
+            ..Overrides::default()
+        });
         assert_eq!(merged.tick, DEFAULT_TICK_MS);
         assert_eq!(merged.layout, LayoutMode::Grid);
+    }
+
+    #[test]
+    fn cli_overrides_can_disable_collectors() {
+        let merged = Config::default().with_overrides(Overrides {
+            gpu: Some(false),
+            battery: Some(false),
+            ..Overrides::default()
+        });
+
+        assert!(!merged.gpu);
+        assert!(!merged.battery);
+        assert!(Config::default().gpu);
+        assert!(Config::default().battery);
+    }
+
+    #[test]
+    fn sort_round_trips_through_toml() {
+        let dir = temp_dir("sort");
+        let path = dir.join("config.toml");
+        let config = Config {
+            sort: SortBy::Memory,
+            ..Config::default()
+        };
+
+        config.save(Some(&path)).expect("save config");
+
+        assert_eq!(Config::load_from(&path).unwrap().sort, SortBy::Memory);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn tick_is_clamped_to_supported_range() {
         let low = Config {
             tick: 1,
-            layout: LayoutMode::Auto,
+            ..Config::default()
         };
         assert_eq!(low.tick_rate(), Duration::from_millis(MIN_TICK_MS));
 
         let high = Config {
             tick: u64::MAX,
-            layout: LayoutMode::Auto,
+            ..Config::default()
         };
         assert_eq!(high.tick_rate(), Duration::from_millis(MAX_TICK_MS));
     }

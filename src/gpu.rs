@@ -21,6 +21,24 @@ enum GpuBackend {
 #[derive(Clone, Default)]
 struct NvidiaShared(Arc<Mutex<Option<NvidiaSample>>>);
 
+impl NvidiaShared {
+    /// Stores the latest sample, ignoring lock poisoning.
+    fn store(&self, sample: NvidiaSample) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sample);
+    }
+
+    /// Reads the latest sample, treating a poisoned lock as "no data yet".
+    fn load(&self) -> Option<NvidiaSample> {
+        match self.0.lock() {
+            Ok(guard) => *guard,
+            Err(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NvidiaSample {
     usage: f32,
@@ -108,9 +126,7 @@ impl Gpu {
                     .map(|milli| (milli / 1000.0) as f32);
             }
             GpuBackend::NvidiaSmi(shared) => {
-                if let Ok(sample) = shared.0.lock()
-                    && let Some(sample) = *sample
-                {
+                if let Some(sample) = shared.load() {
                     self.usage = sample.usage;
                     self.temperature = sample.temperature;
                 }
@@ -202,7 +218,7 @@ fn spawn_nvidia_poller() -> NvidiaShared {
                 return;
             };
 
-            *worker.0.lock().unwrap() = Some(NvidiaSample {
+            worker.store(NvidiaSample {
                 usage: query.usage,
                 temperature: query.temperature,
             });

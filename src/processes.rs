@@ -1,11 +1,14 @@
+use clap::ValueEnum;
 use ratatui::layout::Alignment;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use serde::{Deserialize, Serialize};
 
 use crate::theme::{ACCENT, MUTED};
 
 /// Sort key for the process table.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum SortBy {
     Cpu,
     Memory,
@@ -118,7 +121,23 @@ pub(crate) fn compare_processes(
             .cmp(&a.memory)
             .then_with(|| b.cpu.total_cmp(&a.cpu)),
         SortBy::Pid => a.pid.cmp(&b.pid),
-        SortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        SortBy::Name => compare_names(&a.name, &b.name),
+    }
+}
+
+/// Orders two names case-insensitively.
+///
+/// ASCII names — the overwhelmingly common case for process names — are folded
+/// in place, so the comparator allocates nothing on the sorting hot path. Pairs
+/// containing non-ASCII fall back to `to_lowercase`, preserving the previous
+/// ordering exactly.
+fn compare_names(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        a.bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
+    } else {
+        a.to_lowercase().cmp(&b.to_lowercase())
     }
 }
 
@@ -189,6 +208,33 @@ mod tests {
         assert_eq!(
             compare_processes(SortBy::Name, &a, &b),
             std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn compares_names_case_insensitively() {
+        use std::cmp::Ordering;
+
+        let named = |name: &str| ProcessRow {
+            pid: 1,
+            user: String::new(),
+            name: name.into(),
+            cpu: 0.0,
+            memory: 0,
+        };
+
+        assert_eq!(
+            compare_processes(SortBy::Name, &named("Alpha"), &named("beta")),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_processes(SortBy::Name, &named("ALPHA"), &named("alpha")),
+            Ordering::Equal
+        );
+        // Non-ASCII names still compare case-insensitively via the fallback.
+        assert_eq!(
+            compare_processes(SortBy::Name, &named("ÄBC"), &named("äbc")),
+            Ordering::Equal
         );
     }
 }

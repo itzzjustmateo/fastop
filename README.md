@@ -21,12 +21,16 @@ fastop [OPTIONS]
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `-t, --tick <MS>` | Refresh interval in milliseconds (50–60000) | config file, then `500` |
+| `-t, --tick <DURATION>` | Refresh interval: milliseconds or `500ms` / `2s` / `1m` (50–60000 ms) | config file, then `500` |
 | `-l, --layout <LAYOUT>` | Panel layout: `auto`, `compact`, or `grid` | config file, then `auto` |
+| `-s, --sort <COLUMN>` | Initial process sort: `cpu`, `memory`, `pid`, or `name` | config file, then `cpu` |
+| `--no-gpu` | Skip GPU detection and sampling | |
+| `--no-battery` | Skip battery detection and sampling | |
 | `-c, --config <PATH>` | Use an alternative configuration file | platform config path |
+| `--config-path` | Print the resolved configuration file path and exit | |
 | `--write-config` | Write the effective configuration to the config file and exit | |
 | `-h, --help` | Print help | |
-| `-V, --version` | Print version | |
+| `-v`, `-V`, `--version` | Print version | |
 
 ## Configuration
 
@@ -50,6 +54,13 @@ tick = 500
 
 # Panel layout: "auto", "compact", or "grid"
 layout = "auto"
+
+# Initial process sort: "cpu", "memory", "pid", or "name"
+sort = "cpu"
+
+# Detect and sample a GPU / the battery
+gpu = true
+battery = true
 ```
 
 Invalid TOML is reported on stderr and Fastop falls back to defaults. Run
@@ -82,8 +93,10 @@ cargo fmt
 | `main.rs` | Entry point: parse CLI options, load config and start the app |
 | `cli.rs` | `clap` argument definitions |
 | `config.rs` | Cross-platform configuration file loading and saving |
-| `app.rs` | Application state, event loop and top-level render
-| `panels.rs` | Rendering for each panel (header, footer, CPU, memory, …)
+| `collect.rs` | Data collection: owns the sysinfo/GPU/battery handles and produces the display rows (`Collector`) |
+| `app.rs` | Application state (collector + UI state), event loop and top-level render |
+| `ui/mod.rs` | Panel dispatch and shared rendering helpers |
+| `ui/*.rs` | One module per panel: header, footer, CPU, memory, GPU, disks, network, processes |
 | `layout.rs` | Panel selection and responsive layout decisions |
 | `theme.rs` | Color constants and threshold-based coloring |
 | `widgets.rs` | Reusable UI primitives (panels, meters, bars) |
